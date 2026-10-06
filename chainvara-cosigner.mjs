@@ -132,6 +132,12 @@ function openShare(master, keyId, sealed) {
 
 const today = () => new Date().toISOString().slice(0, 10);
 
+/** USD value of a transfer: Chainvara sends usd_value_cents as an integer string (exact), or null when there is no price. */
+export function usdOf(data) {
+  const v = typeof data.usd_value_cents === "string" && /^-?\d+$/.test(data.usd_value_cents) ? Number(data.usd_value_cents) : data.usd_value_cents;
+  return typeof v === "number" && Number.isFinite(v) ? v / 100 : null;
+}
+
 /** Rules for transfer.sign_request. Returns null to approve, or a refusal reason. */
 export function evaluateTransfer(policy, approvals, data) {
   if (policy.paused) return "Co-signer is paused.";
@@ -140,7 +146,7 @@ export function evaluateTransfer(policy, approvals, data) {
   if ((policy.blockedDestinations ?? []).some((d) => String(d).toLowerCase() === dest)) return "Destination is blocked by the co-signer.";
   const allowed = Array.isArray(policy.allowedDestinations) ? policy.allowedDestinations : [];
   if (allowed.length && !allowed.some((d) => sameDestination(d, data.destination))) return "Destination is not on the co-signer's allowed list.";
-  const usd = typeof data.usd_value_cents === "number" ? data.usd_value_cents / 100 : null;
+  const usd = usdOf(data);
   if (usd === null) return policy.allowUnpricedAssets ? null : "Asset has no USD price and unpriced assets are not allowed.";
   if (usd > Number(policy.maxUsdPerTransfer)) return `Amount $${usd.toFixed(2)} is above the co-signer limit of $${policy.maxUsdPerTransfer} per transfer.`;
   const day = today();
@@ -161,8 +167,9 @@ export function sameDestination(a, b) {
 export function needsHuman(policy, data) {
   const limit = policy.humanApprovalAboveUsd;
   if (limit === null || limit === undefined || limit === "") return false;
-  if (typeof data.usd_value_cents !== "number") return true;
-  return data.usd_value_cents / 100 > Number(limit);
+  const usd = usdOf(data);
+  if (usd === null) return true;
+  return usd > Number(limit);
 }
 
 /** Pending human approvals and decisions (decisions bind to the transfer id AND its intent hash). */
@@ -221,7 +228,7 @@ export function createHandler({ secret, master, onPending }) {
     if (req.type === "transfer.sign_request") {
       const d = req.data;
       const refusal = evaluateTransfer(policy, approvals, d);
-      const base = { type: req.type, request_id: req.request_id, transfer_id: d.id, network: d.network, asset: d.asset?.symbol ?? d.asset?.id, amount: d.amount, usd: d.usd_value_cents ?? null, destination: d.destination };
+      const base = { type: req.type, request_id: req.request_id, transfer_id: d.id, network: d.network, asset: d.asset?.symbol ?? d.asset?.id, amount: d.amount, usd: usdOf(d), destination: d.destination };
       if (refusal) {
         log({ ...base, decision: "reject", reason: refusal });
         return { status: 200, ...(await sdk.cosignerResponse(req, "reject", secret, refusal)) };
@@ -235,7 +242,7 @@ export function createHandler({ secret, master, onPending }) {
         }
         if (!decided) {
           if (!h.pending.some((x) => x.transfer_id === d.id && x.intent_hash === d.intent_hash)) {
-            h.pending.push({ transfer_id: d.id, intent_hash: d.intent_hash, network: d.network, asset: d.asset?.symbol ?? d.asset?.id ?? "", amount: d.amount, usd: typeof d.usd_value_cents === "number" ? d.usd_value_cents / 100 : null, destination: d.destination, note: d.note ?? null, at: new Date().toISOString() });
+            h.pending.push({ transfer_id: d.id, intent_hash: d.intent_hash, network: d.network, asset: d.asset?.symbol ?? d.asset?.id ?? "", amount: d.amount, usd: usdOf(d), destination: d.destination, note: d.note ?? null, at: new Date().toISOString() });
             writeJson(F.human, h);
             log({ ...base, decision: "pending", reason: "waiting for a person" });
             onPending?.(d);
@@ -245,7 +252,7 @@ export function createHandler({ secret, master, onPending }) {
         }
       }
       if (!approvals.some((a) => a.transfer_id === d.id && a.intent_hash === d.intent_hash)) {
-        approvals.push({ transfer_id: d.id, intent_hash: d.intent_hash, usd: typeof d.usd_value_cents === "number" ? d.usd_value_cents / 100 : 0, day: today(), at: new Date().toISOString() });
+        approvals.push({ transfer_id: d.id, intent_hash: d.intent_hash, usd: usdOf(d) ?? 0, day: today(), at: new Date().toISOString() });
       }
       writeJson(F.approvals, approvals);
       log({ ...base, decision: "approve" });
