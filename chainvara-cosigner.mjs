@@ -71,7 +71,8 @@ const DEFAULT_POLICY = {
   blockedDestinations: [],
   humanApprovalAboveUsd: null,
   maxEvmFeeNative: "0.05",
-  _help: "Amounts in US dollars. maxEvmFeeNative: highest network fee an EVM MPC transaction may pay, in the chain's native coin. Empty allowedNetworks / allowedDestinations = any. allowedDestinations: only these addresses (with ?dt= / ?memo= where used) can receive. humanApprovalAboveUsd: above this amount (and for unpriced assets) a person approves on this machine. Changes apply to the next request.",
+  allowContractCalls: false,
+  _help: "allowContractCalls: let MPC EVM wallets sign arbitrary contract calls (dApps); off by default because a call can do anything (swaps, token operations and transfers are checked in detail and stay allowed). Amounts in US dollars. maxEvmFeeNative: highest network fee an EVM MPC transaction may pay, in the chain's native coin. Empty allowedNetworks / allowedDestinations = any. allowedDestinations: only these addresses (with ?dt= / ?memo= where used) can receive. humanApprovalAboveUsd: above this amount (and for unpriced assets) a person approves on this machine. Changes apply to the next request.",
 };
 const APPROVAL_WINDOW_MS = 6 * 3600_000;
 // ECDSA (DKLs23) key generation messages are a few hundred KB.
@@ -267,6 +268,7 @@ export function createHandler({ secret, master, onPending }) {
         approvals.push({
           transfer_id: d.id, intent_hash: d.intent_hash, usd: usdOf(d) ?? 0, day: today(), at: new Date().toISOString(),
           network: d.network, destination: d.destination, amount: d.amount, operation: d.operation ?? "transfer",
+          amount_atomic: d.amount_atomic ?? null, operation_data: d.operation_data ?? null,
           asset: { id: d.asset?.id ?? null, contract: d.asset?.contract ?? null, decimals: d.asset?.decimals ?? null },
         });
       }
@@ -389,9 +391,9 @@ async function handleMpc(req, { secret, master, policy, approvals }) {
   const approved = approvals.find((a) => a.transfer_id === d.transfer_id && a.intent_hash === d.intent_hash && Date.parse(a.at) > Date.now() - APPROVAL_WINDOW_MS);
   if (!approved) return reject("This co-signer has not approved that transfer.");
   const nonceId = `${d.key_id}|${d.transfer_id}`;
-  if (k.suite === "ecdsa") return handleEcdsaSigning(req, d, k, approved, { secret, master, pending, answer, reject, nonceId, policy });
+  if (k.suite === "ecdsa") return handleEcdsaSigning(req, d, k, approved, { secret, master, pending, answer, reject, nonceId, policy, approvals });
   if (req.type === "mpc.sign3") return reject("Unexpected signing step for this wallet.");
-  if (k.suite === "taproot") return handleTaprootSigning(req, d, k, approved, { master, pending, answer, reject, nonceId });
+  if (k.suite === "taproot") return handleTaprootSigning(req, d, k, approved, { master, pending, answer, reject, nonceId, approvals });
   if (req.type === "mpc.commit") {
     const c = frost.commit(openText(master, `mpc|${d.key_id}`, k.key_package));
     pending[nonceId] = { at: new Date().toISOString(), nonces: sealText(master, `nonce|${nonceId}`, c.nonces) };
@@ -408,6 +410,10 @@ async function handleMpc(req, { secret, master, policy, approvals }) {
   const message = Buffer.from(frost.messageOf(sp), "hex");
   const problem = checkSolanaMessage(message, k.address, approved);
   if (problem) return reject(`The transaction does not match what was approved: ${problem}`);
+  // Two Solana transactions with different blockhashes would both be valid: one signature per approval.
+  if (approved.sol_signed_at) return reject("This approval was already signed once: request a new transfer.");
+  approved.sol_signed_at = new Date().toISOString();
+  writeJson(F.approvals, approvals);
   const share = frost.signShare(sp, openText(master, `nonce|${nonceId}`, n.nonces), openText(master, `mpc|${d.key_id}`, k.key_package));
   log({ type: req.type, request_id: req.request_id, key_id: d.key_id, transfer_id: d.transfer_id, decision: "signed share" });
   return answer({ action: "ok", share });
@@ -500,7 +506,7 @@ async function ecdsaKeygen(req, d, { secret, master, keys, pending, answer, reje
  * (it chooses the session id); mpc.sign and mpc.sign3 carry Chainvara's next messages. The hash cannot change after
  * mpc.commit, and the session is single use.
  */
-async function handleEcdsaSigning(req, d, k, approved, { secret, master, pending, answer, reject, nonceId, policy }) {
+async function handleEcdsaSigning(req, d, k, approved, { secret, master, pending, answer, reject, nonceId, policy, approvals }) {
   const party = () => openText(master, `mpc|${d.key_id}`, k.key_package);
   const drop = () => {
     delete pending[nonceId];
@@ -509,6 +515,13 @@ async function handleEcdsaSigning(req, d, k, approved, { secret, master, pending
   if (req.type === "mpc.commit") {
     const checked = checkEvmTransaction(String(d.tx ?? ""), k, approved, policy);
     if (typeof checked === "string") return reject(`The transaction does not match what was approved: ${checked}`);
+    // One approval, one transaction per kind (the swap's token approval and the swap itself are two kinds): every
+    // signature for it must use the same nonce, so a re-signed transaction can replace the first but never add to it.
+    approved.evm_nonces ??= {};
+    const used = approved.evm_nonces[checked.kind];
+    if (used !== undefined && used !== String(checked.nonce)) return reject("This approval was already signed with another nonce: request a new transfer.");
+    approved.evm_nonces[checked.kind] = String(checked.nonce);
+    writeJson(F.approvals, approvals);
     const signId = crypto.randomBytes(16).toString("hex");
     const r = ecdsa.sign1(party(), signId, checked.hash);
     pending[nonceId] = { at: new Date().toISOString(), suite: "ecdsa", step: 1, sign_id: signId, hash: checked.hash, state: sealText(master, `ecdsa-sign|${nonceId}`, r.state) };
@@ -609,16 +622,61 @@ const rlpInt = (b) => {
   return b.length ? BigInt(`0x${b.toString("hex")}`) : 0n;
 };
 
+/** Contracts and code the co-signer knows on its own (a test keeps them equal to Chainvara's). */
+export const EVM_KNOWN = {
+  kyberRouter: "6131b5fae19ea4f9d964eac0408e4408b66337b5",
+  lidoStETH: "ae7ab96520de3a18e5e111b5eaab095312d7fe84",
+  tokenBytecodeKeccak: "6e9f8d098a983a728aa6b9e46365eaf7e73f1843b371ef226ca943cd848e1b5a",
+  tokenBytecodeLength: 4943,
+};
+const EVM_NATIVE = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const hexAddr = (a) => String(a ?? "").toLowerCase().replace(/^0x/, "");
+const pad = (hex) => hex.padStart(64, "0");
+const padInt = (n) => pad(BigInt(n).toString(16));
+
 /**
- * The unsigned EVM transaction must do exactly the approved transfer: right chain id, either the native amount to the
- * approved address with no call data, or one ERC-20 transfer(approved address, approved amount) on the approved
- * token contract with no value, no access list, and a network fee under maxEvmFeeNative. Returns the signing hash.
+ * KyberSwap MetaAggregationRouterV2 swap((callTarget, approveTarget, targetData, desc, clientData)): reads the swap
+ * description: tokens, who receives the output, input amount, guaranteed minimum and fee lists.
+ */
+export function decodeKyberSwap(data) {
+  if (data.length < 36 || data.subarray(0, 4).toString("hex") !== "e21fd0e9") return null;
+  const args = data.subarray(4);
+  const rd = (off) => {
+    if (!Number.isSafeInteger(off) || off < 0 || off + 32 > args.length) throw new Error("truncated");
+    return args.subarray(off, off + 32);
+  };
+  const num = (off) => {
+    const v = BigInt(`0x${rd(off).toString("hex")}`);
+    if (v > BigInt(args.length)) throw new Error("bad offset");
+    return Number(v);
+  };
+  const addr = (w) => {
+    if (!w.subarray(0, 12).every((b) => b === 0)) throw new Error("bad address");
+    return w.subarray(12).toString("hex");
+  };
+  const exec = num(0);
+  const desc = exec + num(exec + 3 * 32);
+  const field = (i) => rd(desc + i * 32);
+  const arrLen = (i) => num(desc + num(desc + i * 32));
+  return {
+    srcToken: addr(field(0)), dstToken: addr(field(1)), feeReceivers: arrLen(4), feeAmounts: arrLen(5),
+    dstReceiver: addr(field(6)), amount: BigInt(`0x${field(7).toString("hex")}`), minReturnAmount: BigInt(`0x${field(8).toString("hex")}`),
+  };
+}
+
+/**
+ * The unsigned EVM transaction must do exactly the approved operation, decoded here independently of Chainvara:
+ * right chain id, no access list, a network fee under maxEvmFeeNative, and for each kind of operation the exact target
+ * contract, value and call data (a transfer to the approved address; a KyberSwap swap whose output goes to this
+ * wallet, of the approved tokens and amount, with at least the approved minimum and no fee, or the exact-amount token
+ * approval for it; a Lido stake; mint, burn, freeze, thaw or supply lock of the approved token; the deployment of
+ * Chainvara's token contract owned by this wallet; a free contract call only if allowContractCalls is on).
+ * Returns the Keccak-256 signing hash, the nonce and the kind of transaction.
  */
 export function checkEvmTransaction(txHex, wallet, approved, policy = DEFAULT_POLICY) {
   if (typeof txHex !== "string" || !/^(0x)?[0-9a-fA-F]+$/.test(txHex) || txHex.replace(/^0x/, "").length % 2) return "invalid transaction encoding";
   const bytes = Buffer.from(txHex.replace(/^0x/, ""), "hex");
   if (bytes.length > 64 * 1024) return "transaction too large";
-  if ((approved.operation ?? "transfer") !== "transfer") return "only plain transfers can be signed with an MPC EVM wallet";
   if (approved.network !== wallet.network) return "network differs";
   const chainId = EVM_CHAIN_IDS[wallet.network];
   if (!chainId) return "unknown EVM network";
@@ -627,45 +685,108 @@ export function checkEvmTransaction(txHex, wallet, approved, policy = DEFAULT_PO
     if (bytes[0] === 0x02) {
       const l = rlpDecode(bytes.subarray(1));
       if (!Array.isArray(l) || l.length !== 9) return "not an EIP-1559 transaction";
-      const [cid, , prio, maxFee, gas, to, value, data, accessList] = l;
+      const [cid, nonce, prio, maxFee, gas, to, value, data, accessList] = l;
       if (!Array.isArray(accessList) || accessList.length) return "access lists are not allowed";
       if (rlpInt(prio) > rlpInt(maxFee)) return "priority fee above max fee";
-      f = { chainId: rlpInt(cid), gas: rlpInt(gas), price: rlpInt(maxFee), to, value: rlpInt(value), data };
+      f = { chainId: rlpInt(cid), nonce: rlpInt(nonce), gas: rlpInt(gas), price: rlpInt(maxFee), to, value: rlpInt(value), data };
     } else if (bytes[0] >= 0xc0) {
       const l = rlpDecode(bytes);
       if (!Array.isArray(l) || l.length !== 9) return "not an EIP-155 transaction";
-      const [, gasPrice, gas, to, value, data, cid, r, sv] = l;
+      const [nonce, gasPrice, gas, to, value, data, cid, r, sv] = l;
       if (rlpInt(r) !== 0n || rlpInt(sv) !== 0n) return "not an unsigned EIP-155 transaction";
-      f = { chainId: rlpInt(cid), gas: rlpInt(gas), price: rlpInt(gasPrice), to, value: rlpInt(value), data };
+      f = { chainId: rlpInt(cid), nonce: rlpInt(nonce), gas: rlpInt(gas), price: rlpInt(gasPrice), to, value: rlpInt(value), data };
     } else return "unsupported transaction type";
   } catch (e) {
     return `malformed transaction (${e.message})`;
   }
-  if (!Buffer.isBuffer(f.to) || f.to.length !== 20) return "contract creation or invalid recipient";
+  if (!Buffer.isBuffer(f.to) || (f.to.length !== 20 && f.to.length !== 0)) return "invalid recipient";
   if (!Buffer.isBuffer(f.data)) return "invalid call data";
   if (f.chainId !== BigInt(chainId)) return `chain id ${f.chainId} is not ${wallet.network} (${chainId})`;
   const feeLimit = String(policy.maxEvmFeeNative ?? DEFAULT_POLICY.maxEvmFeeNative);
   if (f.gas * f.price > atomic(feeLimit, 18)) return `network fee above the ${feeLimit} limit (maxEvmFeeNative)`;
-  const hexAddr = (a) => String(a ?? "").toLowerCase().replace(/^0x/, "");
+  const op = approved.operation ?? "transfer";
+  const od = approved.operation_data ?? {};
+  if (op !== "token_create" && f.to.length !== 20) return "contract creation is only allowed to create a token";
   const to = f.to.toString("hex");
-  const contract = approved.asset?.contract ? hexAddr(approved.asset.contract) : null;
-  if (!/^[0-9a-f]{40}$/.test(hexAddr(approved.destination))) return "approved destination is not an EVM address";
+  const data = f.data.toString("hex");
+  const own = hexAddr(wallet.address);
+  const done = (kind) => ({ hash: ecdsa.keccak256(bytes.toString("hex")), nonce: f.nonce, kind });
   try {
-    if (!contract) {
-      if (to !== hexAddr(approved.destination)) return "recipient differs";
-      if (f.value !== atomic(approved.amount, approved.asset?.decimals ?? 18)) return "amount differs";
-      if (f.data.length) return "unexpected call data";
-    } else {
-      if (to !== contract) return "token contract differs";
-      if (f.value !== 0n) return "token transfer carries a native value";
-      const amount = atomic(approved.amount, approved.asset.decimals ?? 18);
-      const expected = `a9059cbb${hexAddr(approved.destination).padStart(64, "0")}${amount.toString(16).padStart(64, "0")}`;
-      if (f.data.toString("hex") !== expected) return "token transfer differs (recipient or amount)";
+    const amount = approved.amount_atomic != null ? BigInt(approved.amount_atomic) : atomic(approved.amount, approved.asset?.decimals ?? 18);
+    const sameToken = () => to === hexAddr(od.token) && f.value === 0n;
+    switch (op) {
+      case "transfer": {
+        const contract = approved.asset?.contract ? hexAddr(approved.asset.contract) : null;
+        if (!/^[0-9a-f]{40}$/.test(hexAddr(approved.destination))) return "approved destination is not an EVM address";
+        if (!contract) {
+          if (to !== hexAddr(approved.destination)) return "recipient differs";
+          if (f.value !== amount) return "amount differs";
+          if (f.data.length) return "unexpected call data";
+        } else {
+          if (to !== contract) return "token contract differs";
+          if (f.value !== 0n) return "token transfer carries a native value";
+          if (data !== `a9059cbb${pad(hexAddr(approved.destination))}${padInt(amount)}`) return "token transfer differs (recipient or amount)";
+        }
+        return done("transfer");
+      }
+      case "swap": {
+        const sellNative = od.sell === "native";
+        const sell = sellNative ? EVM_NATIVE : hexAddr(od.sell);
+        const buy = od.buy === "native" ? EVM_NATIVE : hexAddr(od.buy);
+        const minOut = BigInt(od.minOut ?? "0");
+        if (!/^[0-9a-f]{40}$/.test(sell) || !/^[0-9a-f]{40}$/.test(buy) || minOut <= 0n) return "approved swap is not readable";
+        if (to === EVM_KNOWN.kyberRouter) {
+          if (f.value !== (sellNative ? amount : 0n)) return "swap value differs";
+          const sw = decodeKyberSwap(f.data);
+          if (!sw) return "not a KyberSwap swap";
+          if (sw.srcToken !== sell || sw.dstToken !== buy) return "swap tokens differ";
+          if (sw.dstReceiver !== own) return "the swap output does not go to this wallet";
+          if (sw.amount !== amount) return "swap amount differs";
+          if (sw.minReturnAmount < minOut) return "guaranteed output below the approved minimum";
+          if (sw.feeReceivers || sw.feeAmounts) return "the swap takes a fee";
+          return done("swap");
+        }
+        if (!sellNative && to === sell) {
+          if (f.value !== 0n || data !== `095ea7b3${pad(EVM_KNOWN.kyberRouter)}${padInt(amount)}`) return "token approval differs (spender or amount)";
+          return done("approve");
+        }
+        return "the swap calls an unknown contract";
+      }
+      case "liquid_stake":
+        if (wallet.network !== "ethereum" || to !== EVM_KNOWN.lidoStETH || f.value !== amount || data !== `a1903eab${pad("")}`) return "Lido stake differs";
+        return done("liquid_stake");
+      case "token_mint":
+        if (!sameToken() || data !== `40c10f19${pad(hexAddr(od.to))}${padInt(amount)}`) return "mint differs (token, recipient or amount)";
+        return done(op);
+      case "token_burn":
+        if (!sameToken() || data !== `42966c68${padInt(amount)}`) return "burn differs (token or amount)";
+        return done(op);
+      case "token_freeze":
+      case "token_thaw":
+        if (!sameToken() || data !== `ac869cd8${pad(hexAddr(od.holder))}${padInt(op === "token_freeze" ? 1 : 0)}`) return "freeze differs (token or holder)";
+        return done(op);
+      case "token_lock_supply":
+        if (!sameToken() || data !== "7d64bcb4") return "supply lock differs";
+        return done(op);
+      case "token_create": {
+        if (f.to.length !== 0 || f.value !== 0n) return "a token creation deploys a contract without value";
+        const L = EVM_KNOWN.tokenBytecodeLength;
+        if (f.data.length < L + 7 * 32) return "token contract code too short";
+        if (ecdsa.keccak256(f.data.subarray(0, L).toString("hex")) !== EVM_KNOWN.tokenBytecodeKeccak) return "not Chainvara's token contract";
+        const owner = f.data.subarray(L + 4 * 32, L + 5 * 32);
+        if (!owner.subarray(0, 12).every((b) => b === 0) || owner.subarray(12).toString("hex") !== own) return "the token owner is not this wallet";
+        return done(op);
+      }
+      case "contract_call":
+        if (!policy.allowContractCalls) return "contract calls are turned off on this co-signer (allowContractCalls in policy.json)";
+        if (to !== hexAddr(od.to) || f.value !== amount || data !== hexAddr(od.data)) return "contract call differs";
+        return done(op);
+      default:
+        return `${op} cannot be signed with an MPC EVM wallet`;
     }
   } catch {
-    return "approved amount is not readable";
+    return "approved operation is not readable";
   }
-  return { hash: ecdsa.keccak256(bytes.toString("hex")) };
 }
 
 /**
@@ -673,7 +794,7 @@ export function checkEvmTransaction(txHex, wallet, approved, policy = DEFAULT_PO
  * mpc.sign { tx, prevouts, signing_packages } → the co-signer rebuilds every BIP-341 sighash from the unsigned
  * transaction and the spent outputs, checks the transaction against the approval, and signs only those sighashes.
  */
-async function handleTaprootSigning(req, d, k, approved, { master, pending, answer, reject, nonceId }) {
+async function handleTaprootSigning(req, d, k, approved, { master, pending, answer, reject, nonceId, approvals }) {
   if (req.type === "mpc.commit") {
     const n = Number(d.inputs);
     if (!Number.isInteger(n) || n < 1 || n > MAX_TAPROOT_INPUTS) return reject("Invalid number of inputs.");
@@ -694,6 +815,10 @@ async function handleTaprootSigning(req, d, k, approved, { master, pending, answ
   const checked = checkBitcoinTaproot(String(d.tx ?? ""), d.prevouts, k, approved);
   if (typeof checked === "string") return reject(`The transaction does not match what was approved: ${checked}`);
   if (checked.length !== packages.length) return reject("The transaction has a different number of inputs.");
+  const outpoints = [...checked.outpoints].sort().join(",");
+  if (approved.btc_outpoints && approved.btc_outpoints !== outpoints) return reject("This approval was already signed spending other coins: request a new transfer.");
+  approved.btc_outpoints = outpoints;
+  writeJson(F.approvals, approvals);
   for (const [i, sp] of packages.entries()) {
     if (taproot.messageOf(sp) !== checked[i]) return reject(`Input ${i + 1}: the signing package is not over this transaction.`);
   }
@@ -889,9 +1014,12 @@ export function checkBitcoinTaproot(txHex, prevouts, wallet, approved) {
   const shaScripts = sha256(Buffer.concat(spent.map((p) => Buffer.concat([compact(p.script.length), p.script]))));
   const shaSequences = sha256(Buffer.concat(tx.ins.map((i) => u32le(i.sequence))));
   const shaOutputs = sha256(Buffer.concat(tx.outs.map((o) => Buffer.concat([u64le(o.value), compact(o.script.length), o.script]))));
-  return tx.ins.map((_, i) =>
+  const sighashes = tx.ins.map((_, i) =>
     tagged("TapSighash", Buffer.concat([Buffer.from([0x00, 0x00]), u32le(tx.version), u32le(tx.locktime), shaPrevouts, shaAmounts, shaScripts, shaSequences, shaOutputs, Buffer.from([0x00]), u32le(i)])).toString("hex"),
   );
+  // The coins spent, so a second signature for the same approval can only conflict with the first, never add to it.
+  sighashes.outpoints = tx.ins.map((i) => i.outpoint.toString("hex"));
+  return sighashes;
 }
 
 // ---------------------------------------------------------------- Solana transaction check (independent of Chainvara)
