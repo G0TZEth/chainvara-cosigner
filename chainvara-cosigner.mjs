@@ -73,7 +73,8 @@ const DEFAULT_POLICY = {
   maxEvmFeeNative: "0.05",
   allowContractCalls: false,
   maxTronFeeLimitTrx: "50",
-  _help: "maxTronFeeLimitTrx: highest energy fee a TRC-20 transfer from a Tron MPC wallet may allow. allowContractCalls: let MPC EVM wallets sign arbitrary contract calls (dApps); off by default because a call can do anything (swaps, token operations and transfers are checked in detail and stay allowed). Amounts in US dollars. maxEvmFeeNative: highest network fee an EVM MPC transaction may pay, in the chain's native coin. Empty allowedNetworks / allowedDestinations = any. allowedDestinations: only these addresses (with ?dt= / ?memo= where used) can receive. humanApprovalAboveUsd: above this amount (and for unpriced assets) a person approves on this machine. Changes apply to the next request.",
+  allowRiskySignatures: false,
+  _help: "allowRiskySignatures: let MPC EVM wallets sign off-chain permits (EIP-2612, Permit2), marketplace orders and blind 32-byte hashes; off by default because each can hand over tokens without any transaction. maxTronFeeLimitTrx: highest energy fee a TRC-20 transfer from a Tron MPC wallet may allow. allowContractCalls: let MPC EVM wallets sign arbitrary contract calls (dApps); off by default because a call can do anything (swaps, token operations and transfers are checked in detail and stay allowed). Amounts in US dollars. maxEvmFeeNative: highest network fee an EVM MPC transaction may pay, in the chain's native coin. Empty allowedNetworks / allowedDestinations = any. allowedDestinations: only these addresses (with ?dt= / ?memo= where used) can receive. humanApprovalAboveUsd: above this amount (and for unpriced assets) a person approves on this machine. Changes apply to the next request.",
 };
 const APPROVAL_WINDOW_MS = 6 * 3600_000;
 // ECDSA (DKLs23) key generation messages are a few hundred KB.
@@ -517,7 +518,8 @@ async function handleEcdsaSigning(req, d, k, approved, { secret, master, pending
   };
   if (req.type === "mpc.commit") {
     const tron = TRON_NETWORKS.has(k.network);
-    const checked = tron ? checkTronTransaction(String(d.tx ?? ""), k, approved, policy) : checkEvmTransaction(String(d.tx ?? ""), k, approved, policy);
+    const checked = approved.operation === "sign_message" && !tron ? checkEvmMessage(k, approved, policy)
+      : tron ? checkTronTransaction(String(d.tx ?? ""), k, approved, policy) : checkEvmTransaction(String(d.tx ?? ""), k, approved, policy);
     if (typeof checked === "string") return reject(`The transaction does not match what was approved: ${checked}`);
     // Tron has no nonce: two transactions with different reference blocks would both be valid. One signature per approval.
     if (tron && approved.tron_signed_at) return reject("This approval was already signed once: request a new transfer.");
@@ -794,6 +796,103 @@ export function checkEvmTransaction(txHex, wallet, approved, policy = DEFAULT_PO
   } catch {
     return "approved operation is not readable";
   }
+}
+
+// ---------------------------------------------------------------- EVM message signatures (EIP-191, EIP-712)
+
+const keccakHex = (hex) => ecdsa.keccak256(hex);
+const keccakBuf = (buf) => Buffer.from(keccakHex(Buffer.from(buf).toString("hex")), "hex");
+
+/** EIP-712 hashStruct and signing hash, implemented here from the specification (independent of Chainvara's library). */
+export function eip712Hash(typed) {
+  const types = { ...(typed?.types ?? {}) };
+  const domain = typed?.domain ?? {};
+  if (!types.EIP712Domain) {
+    const fields = [["name", "string"], ["version", "string"], ["chainId", "uint256"], ["verifyingContract", "address"], ["salt", "bytes32"]];
+    types.EIP712Domain = fields.filter(([k]) => domain[k] !== undefined).map(([name, type]) => ({ name, type }));
+  }
+  const base = (t) => t.replace(/(\[\d*\])+$/, "");
+  const deps = (t, found = new Set()) => {
+    if (found.has(t) || !types[t]) return found;
+    found.add(t);
+    for (const field of types[t]) deps(base(field.type), found);
+    return found;
+  };
+  const encodeType = (t) => {
+    const others = [...deps(t)].filter((x) => x !== t).sort();
+    return [t, ...others].map((n) => `${n}(${types[n].map((x) => `${x.type} ${x.name}`).join(",")})`).join("");
+  };
+  const word = (n) => {
+    const v = BigInt(n);
+    const two = v < 0n ? (1n << 256n) + v : v;
+    if (two < 0n || two >= 1n << 256n) throw new Error("integer out of range");
+    return Buffer.from(two.toString(16).padStart(64, "0"), "hex");
+  };
+  const encodeValue = (type, value) => {
+    const arr = /^(.*)\[(\d*)\]$/.exec(type);
+    if (arr) {
+      if (!Array.isArray(value) || (arr[2] && value.length !== Number(arr[2]))) throw new Error(`${type} expects an array`);
+      return keccakBuf(Buffer.concat(value.map((v) => encodeValue(arr[1], v))));
+    }
+    if (types[type]) return hashStruct(type, value);
+    if (type === "string") return keccakBuf(Buffer.from(String(value), "utf8"));
+    if (type === "bytes") return keccakBuf(Buffer.from(String(value).replace(/^0x/, ""), "hex"));
+    if (type === "bool") return word(value === true || value === "true" ? 1 : 0);
+    if (type === "address") {
+      const a = hexAddr(value);
+      if (!/^[0-9a-f]{40}$/.test(a)) throw new Error("bad address");
+      return Buffer.from(pad(a), "hex");
+    }
+    if (/^u?int\d*$/.test(type)) return word(value);
+    const fixed = /^bytes(\d+)$/.exec(type);
+    if (fixed) {
+      const b = Buffer.from(String(value).replace(/^0x/, ""), "hex");
+      if (b.length > Number(fixed[1])) throw new Error(`${type} too long`);
+      return Buffer.concat([b, Buffer.alloc(32 - b.length)]);
+    }
+    throw new Error(`unsupported type ${type}`);
+  };
+  const hashStruct = (t, value) => {
+    if (!value || typeof value !== "object") throw new Error(`${t} expects an object`);
+    return keccakBuf(Buffer.concat([keccakBuf(Buffer.from(encodeType(t), "utf8")), ...types[t].map((x) => encodeValue(x.type, value[x.name]))]));
+  };
+  const parts = [Buffer.from([0x19, 0x01]), hashStruct("EIP712Domain", domain)];
+  if (typed.primaryType !== "EIP712Domain") parts.push(hashStruct(typed.primaryType, typed.message));
+  return keccakBuf(Buffer.concat(parts)).toString("hex");
+}
+
+const RISKY_TYPED = new Set(["Permit", "PermitSingle", "PermitBatch", "PermitTransferFrom", "PermitBatchTransferFrom", "PermitWitnessTransferFrom", "PermitBatchWitnessTransferFrom", "OrderComponents", "Order", "BulkOrder", "MetaTransaction", "ForwardRequest"]);
+
+/**
+ * The message the co-signer approved (operation_data, covered by the intent hash), hashed here: EIP-191 personal_sign
+ * or EIP-712 typed data. Refused: typed data for another chain; and, unless allowRiskySignatures is on, permits,
+ * marketplace orders, meta-transactions and blind 32-byte hashes.
+ */
+export function checkEvmMessage(wallet, approved, policy = DEFAULT_POLICY) {
+  if (approved.network !== wallet.network) return "network differs";
+  const chainId = EVM_CHAIN_IDS[wallet.network];
+  if (!chainId) return "unknown EVM network";
+  const od = approved.operation_data ?? {};
+  try {
+    if (od.method === "personal_sign") {
+      const msg = Buffer.from(String(od.payload ?? "").replace(/^0x/, ""), "hex");
+      const printable = msg.length > 0 && [...msg].every((b) => b === 9 || b === 10 || b === 13 || (b >= 32 && b < 127) || b >= 128);
+      if (msg.length === 32 && !printable && !policy.allowRiskySignatures) return "blind signature of a 32-byte hash (allowRiskySignatures is off)";
+      const hash = keccakBuf(Buffer.concat([Buffer.from(`\x19Ethereum Signed Message:\n${msg.length}`, "utf8"), msg])).toString("hex");
+      return { hash, nonce: "message", kind: "message" };
+    }
+    if (od.method === "eth_signTypedData_v4") {
+      const typed = typeof od.payload === "string" ? JSON.parse(od.payload) : od.payload;
+      const domainChain = typed?.domain?.chainId;
+      if (domainChain !== undefined && BigInt(domainChain) !== BigInt(chainId)) return `typed data for chain ${domainChain}, not ${wallet.network} (${chainId})`;
+      const spends = typed?.message && typeof typed.message === "object" && "spender" in typed.message;
+      if ((RISKY_TYPED.has(typed?.primaryType) || spends) && !policy.allowRiskySignatures) return `${typed.primaryType} signature: it can move tokens without a transaction (allowRiskySignatures is off)`;
+      return { hash: eip712Hash(typed), nonce: "message", kind: "message" };
+    }
+  } catch (e) {
+    return `unreadable message (${String(e?.message ?? e).slice(0, 80)})`;
+  }
+  return "unsupported signature method";
 }
 
 // ---------------------------------------------------------------- Tron transaction check (independent of Chainvara)
