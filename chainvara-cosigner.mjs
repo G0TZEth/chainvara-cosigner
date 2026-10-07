@@ -420,6 +420,7 @@ async function handleMpc(req, { secret, master, policy, approvals }) {
     : chain === "stellar" ? checkStellarTransaction(d.tx, message, k, approved, policy)
     : chain === "aptos" ? checkAptosMessage(message, k, approved, policy)
     : chain === "sui" ? await checkSuiTransaction(d.tx, message, k, approved, policy)
+    : chain === "ton" ? checkTonTransaction(d.tx, message, k, approved)
     : { problem: checkSolanaMessage(message, k.address, approved) };
   if (checked.problem) return reject(`The transaction does not match what was approved: ${checked.problem}`);
   if (chain === "solana") {
@@ -428,7 +429,7 @@ async function handleMpc(req, { secret, master, policy, approvals }) {
     approved.sol_signed_at = new Date().toISOString();
   } else {
     // XRP Ledger, Stellar, Aptos: an account sequence number is used once on chain. Re-signing with the same one
-    // (after an expiry) is safe; another one could pay twice. Sui: the same transaction digest only.
+    // (after an expiry) is safe; another one could pay twice. Sui: the same transaction digest only. TON: one seqno.
     if (approved.ed_sequence != null && approved.ed_sequence !== checked.sequence) return reject("This approval was already signed with another sequence number (it could be paid twice): request a new transfer.");
     approved.ed_sequence = checked.sequence;
   }
@@ -443,7 +444,7 @@ async function handleMpc(req, { secret, master, policy, approvals }) {
 // The co-signer decodes each chain's own transaction format, byte by byte, refuses any field it does not expect,
 // and compares every value with the transfer it approved. It never trusts Chainvara's description of the transaction.
 
-const ED25519_CHAINS = { xrpl: "xrpl", "xrpl-testnet": "xrpl", stellar: "stellar", "stellar-testnet": "stellar", aptos: "aptos", "aptos-testnet": "aptos", sui: "sui", "sui-testnet": "sui" };
+const ED25519_CHAINS = { xrpl: "xrpl", "xrpl-testnet": "xrpl", stellar: "stellar", "stellar-testnet": "stellar", aptos: "aptos", "aptos-testnet": "aptos", sui: "sui", "sui-testnet": "sui", ton: "ton", "ton-testnet": "ton" };
 const ed25519ChainOf = (network) => ED25519_CHAINS[network] ?? "solana";
 const sha256b = (b) => crypto.createHash("sha256").update(b).digest();
 const approvedAtomic = (approved, decimals) => (approved.amount_atomic != null ? BigInt(approved.amount_atomic) : atomic(approved.amount, decimals));
@@ -553,6 +554,7 @@ export function ed25519Address(network, publicKeyHex) {
     case "stellar": return stellarEncode(pub);
     case "aptos": return aptosAddressOf(pub);
     case "sui": return `0x${blake2b256(Buffer.concat([Buffer.from([0]), pub])).toString("hex")}`;
+    case "ton": return tonW5Address(pub, network === "ton-testnet");
     default: return base58(pub);
   }
 }
@@ -914,6 +916,210 @@ export async function checkSuiTransaction(txB64, message, k, approved, policy = 
   return { problem: null, sequence: `sui:${sim.digest}` };
 }
 
+// ---------------------------------------------------------------- TON (FROST Ed25519, wallet v5r1)
+//
+// Chainvara sends the bag of cells whose hash is signed. The co-signer parses it, recomputes every cell hash itself,
+// and decodes the W5 request: network wallet id, expiry, seqno, exactly one message send in a safe mode (no
+// "carry all balance", no self-destruct), recipient, amount in TON, optional text comment, nothing else.
+
+const TON_WALLET_ID = { ton: 0x7fffff11, "ton-testnet": 0x7ffffffd };
+// Wallet v5r1 code: only its hash and depth enter the address (StateInit cell hash).
+const W5_CODE_HASH = Buffer.from("20834b7b72b112147e1b2fb457b84e74d1a30f04f737d4f62a668e9552d2b72f", "hex");
+const W5_CODE_DEPTH = 6;
+
+/** Parses a bag of cells with one root (ordinary cells only) and computes every representation hash. */
+export function parseBoc(b) {
+  if (b.length < 6 || b.readUInt32BE(0) !== 0xb5ee9c72) throw new Error("not a bag of cells");
+  const flags = b[4];
+  const hasIdx = flags & 0x80;
+  const hasCrc = flags & 0x40;
+  const sizeBytes = flags & 7;
+  const offBytes = b[5];
+  if (sizeBytes < 1 || sizeBytes > 4 || offBytes < 1 || offBytes > 8) throw new Error("bad header");
+  let o = 6;
+  const rd = (n) => {
+    if (o + n > b.length) throw new Error("truncated");
+    let v = 0;
+    for (let i = 0; i < n; i++) v = v * 256 + b[o++];
+    return v;
+  };
+  const count = rd(sizeBytes);
+  const roots = rd(sizeBytes);
+  const absent = rd(sizeBytes);
+  const totalSize = rd(offBytes);
+  if (roots !== 1 || absent !== 0 || count < 1 || count > 64) throw new Error("unexpected cell count");
+  const rootIndex = rd(sizeBytes);
+  if (hasIdx) o += count * offBytes;
+  const start = o;
+  const raw = [];
+  for (let i = 0; i < count; i++) {
+    if (o + 2 > b.length) throw new Error("truncated");
+    const d1 = b[o++];
+    const d2 = b[o++];
+    if (d1 & 0xf8) throw new Error("exotic or high-level cells are not accepted");
+    const nRefs = d1 & 7;
+    if (nRefs > 4) throw new Error("too many references");
+    const len = Math.ceil(d2 / 2);
+    if (o + len > b.length) throw new Error("truncated");
+    const data = Buffer.from(b.subarray(o, o + len));
+    o += len;
+    let bits = Math.floor(d2 / 2) * 8;
+    if (d2 & 1) {
+      const last = data[len - 1];
+      if (!last) throw new Error("missing completion tag");
+      let tz = 0;
+      while (!((last >> tz) & 1)) tz++;
+      bits = (len - 1) * 8 + (7 - tz);
+    }
+    const refs = [];
+    for (let r = 0; r < nRefs; r++) refs.push(rd(sizeBytes));
+    raw.push({ d1, d2, data, bits, refs });
+  }
+  if (o - start !== totalSize) throw new Error("bad total size");
+  if (o + (hasCrc ? 4 : 0) !== b.length) throw new Error("trailing bytes");
+  const cells = new Array(count);
+  for (let i = count - 1; i >= 0; i--) {
+    const c = raw[i];
+    const refs = c.refs.map((j) => {
+      if (j <= i || j >= count) throw new Error("bad reference order");
+      return cells[j];
+    });
+    const depth = refs.length ? Math.max(...refs.map((r) => r.depth)) + 1 : 0;
+    const repr = Buffer.concat([Buffer.from([c.d1, c.d2]), c.data, ...refs.map((r) => Buffer.from([r.depth >> 8, r.depth & 255])), ...refs.map((r) => r.hash)]);
+    cells[i] = { data: c.data, bits: c.bits, refs, depth, hash: sha256b(repr) };
+  }
+  if (rootIndex >= count) throw new Error("bad root");
+  return cells[rootIndex];
+}
+
+class CellReader {
+  constructor(cell) {
+    this.c = cell;
+    this.p = 0;
+    this.r = 0;
+  }
+  bit() {
+    if (this.p >= this.c.bits) throw new Error("cell underflow");
+    const v = (this.c.data[this.p >> 3] >> (7 - (this.p & 7))) & 1;
+    this.p++;
+    return v;
+  }
+  uint(n) {
+    let v = 0n;
+    for (let i = 0; i < n; i++) v = (v << 1n) | BigInt(this.bit());
+    return v;
+  }
+  ref() {
+    if (this.r >= this.c.refs.length) throw new Error("missing reference");
+    return this.c.refs[this.r++];
+  }
+  left() {
+    return this.c.bits - this.p;
+  }
+  done() {
+    return this.p === this.c.bits && this.r === this.c.refs.length;
+  }
+}
+
+/** TON address: raw "wc:hex" or user-friendly base64 (36 bytes, CRC16-XModem). */
+export function tonParseAddress(s) {
+  const raw = /^(-?\d+):([0-9a-fA-F]{64})$/.exec(String(s));
+  if (raw) return { wc: Number(raw[1]), hash: Buffer.from(raw[2], "hex") };
+  if (!/^[A-Za-z0-9_+/=-]{48}$/.test(String(s))) return null;
+  const b = Buffer.from(String(s).replace(/-/g, "+").replace(/_/g, "/"), "base64");
+  if (b.length !== 36 || b.readUInt16BE(34) !== crc16x(b.subarray(0, 34))) return null;
+  return { wc: b.readInt8(1), hash: b.subarray(2, 34) };
+}
+
+/** Address of a wallet v5r1 for a public key (workchain 0, default subwallet), non-bounceable form like Chainvara's. */
+export function tonW5Address(pub, testnet) {
+  const bits = [1, ...Array(32).fill(0)];
+  const id = testnet ? TON_WALLET_ID["ton-testnet"] : TON_WALLET_ID.ton;
+  for (let i = 31; i >= 0; i--) bits.push((id >>> i) & 1);
+  for (const byte of pub) for (let i = 7; i >= 0; i--) bits.push((byte >> i) & 1);
+  bits.push(0);
+  const n = bits.length; // 322
+  const padded = [...bits, 1];
+  while (padded.length % 8) padded.push(0);
+  const data = Buffer.alloc(padded.length / 8);
+  padded.forEach((v, i) => {
+    if (v) data[i >> 3] |= 0x80 >> (i & 7);
+  });
+  const dataHash = sha256b(Buffer.concat([Buffer.from([0, Math.floor(n / 8) + Math.ceil(n / 8)]), data]));
+  // StateInit: no split depth, not special, code and data references, no library: bits 00110 + completion tag.
+  const init = sha256b(Buffer.concat([Buffer.from([2, 1, 0x34]), Buffer.from([W5_CODE_DEPTH >> 8, W5_CODE_DEPTH & 255]), Buffer.from([0, 0]), W5_CODE_HASH, dataHash]));
+  const body = Buffer.concat([Buffer.from([testnet ? 0x51 | 0x80 : 0x51, 0]), init]);
+  const crc = crc16x(body);
+  return Buffer.concat([body, Buffer.from([crc >> 8, crc & 255])]).toString("base64").replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+export function checkTonTransaction(bocB64, message, k, approved) {
+  let root;
+  try {
+    root = parseBoc(Buffer.from(String(bocB64 ?? ""), "base64"));
+  } catch (e) {
+    return { problem: `malformed transaction (${e.message})` };
+  }
+  if (!root.hash.equals(Buffer.from(message))) return { problem: "the hash to sign is not the hash of this transaction" };
+  let t;
+  try {
+    const s = new CellReader(root);
+    if (s.uint(32) !== 0x7369676en) throw new Error("not a signed external request");
+    t = { walletId: Number(s.uint(32)), validUntil: Number(s.uint(32)), seqno: Number(s.uint(32)) };
+    if (!s.bit()) throw new Error("no action");
+    const list = s.ref();
+    if (s.bit()) throw new Error("extended actions are not accepted");
+    if (!s.done()) throw new Error("trailing request data");
+    const l = new CellReader(list);
+    const prev = l.ref();
+    if (prev.bits !== 0 || prev.refs.length) throw new Error("exactly one action is accepted");
+    if (l.uint(32) !== 0x0ec3c86dn) throw new Error("only message sends are accepted");
+    t.mode = Number(l.uint(8));
+    const msg = l.ref();
+    if (!l.done()) throw new Error("trailing action data");
+    const m = new CellReader(msg);
+    if (m.bit() !== 0) throw new Error("not an internal message");
+    m.bit();
+    m.bit();
+    m.bit();
+    if (m.uint(2) !== 0n) throw new Error("unexpected source address");
+    if (m.uint(2) !== 2n || m.bit() !== 0) throw new Error("unsupported destination address");
+    t.wc = Number(BigInt.asIntN(8, m.uint(8)));
+    t.dest = Buffer.from(m.uint(256).toString(16).padStart(64, "0"), "hex");
+    const grams = () => m.uint(Number(m.uint(4)) * 8);
+    t.value = grams();
+    if (m.bit()) throw new Error("extra currencies are not accepted");
+    grams();
+    grams();
+    m.uint(64);
+    m.uint(32);
+    if (m.bit()) throw new Error("state init is not accepted");
+    const inRef = m.bit();
+    const body = inRef ? new CellReader(m.ref()) : m;
+    t.memo = null;
+    if (body.left() > 0 || body.r < body.c.refs.length) {
+      if (body.uint(32) !== 0n) throw new Error("only text comments are accepted");
+      if (body.left() % 8 || body.r < body.c.refs.length) throw new Error("only short text comments are accepted");
+      const bytes = [];
+      while (body.left() > 0) bytes.push(Number(body.uint(8)));
+      t.memo = Buffer.from(bytes).toString("utf8");
+    }
+    if (!body.done() || !m.done()) throw new Error("trailing message data");
+  } catch (e) {
+    return { problem: `malformed transaction (${e.message})` };
+  }
+  if (!isPlainTransfer(approved) || approved.asset?.contract) return { problem: "MPC wallets sign plain TON transfers only" };
+  if (t.walletId !== TON_WALLET_ID[k.network]) return { problem: "the request is for another network or wallet" };
+  if (t.mode !== 3 && t.mode !== 1) return { problem: `send mode ${t.mode} is not accepted` };
+  if (t.validUntil > Math.floor(Date.now() / 1000) + 86_400) return { problem: "the request must expire within 24 hours" };
+  const dest = splitDestination(approved.destination);
+  const to = tonParseAddress(dest.address);
+  if (!to || to.wc !== t.wc || !to.hash.equals(t.dest)) return { problem: "TON goes to another address" };
+  if (t.value !== approvedAtomic(approved, 9)) return { problem: "TON amount differs" };
+  if ((dest.tag ?? null) !== t.memo) return { problem: "comment differs" };
+  return { problem: null, sequence: `ton:${t.seqno}` };
+}
+
 /**
  * EVM networks and their chain ids, kept here so the co-signer knows on its own which chain a transaction targets
  * (a signature for another chain id could be replayed there). A test keeps this list equal to Chainvara's registry.
@@ -921,7 +1127,7 @@ export async function checkSuiTransaction(txB64, message, k, approved, policy = 
 export const EVM_CHAIN_IDS = {"ethereum":1,"base":8453,"arbitrum":42161,"polygon":137,"optimism":10,"bnb":56,"avalanche":43114,"linea":59144,"zksync":324,"scroll":534352,"mantle":5000,"blast":81457,"gnosis":100,"celo":42220,"sonic":146,"unichain":130,"worldchain":480,"ink":57073,"berachain":80094,"zora":7777777,"mode":34443,"cronos":25,"kava":2222,"metis":1088,"opbnb":204,"taiko":167000,"abstract":2741,"sei":1329,"arbitrum-nova":42170,"boba":288,"lisk":1135,"bob":60808,"immutable":13371,"soneium":1868,"flare":14,"aurora":1313161554,"ronin":2020,"manta":169,"core":1116,"rootstock":30,"fantom":250,"harmony":1666600000,"xlayer":196,"plasma":9745,"monad":143,"hyperevm":999,"katana":747474,"apechain":33139,"story":1514,"sophon":50104,"ethereum-sepolia":11155111,"base-sepolia":84532,"arbitrum-sepolia":421614,"polygon-amoy":80002};
 const MPC_SUITE = {
   solana: "ed25519", "solana-devnet": "ed25519", "solana-testnet": "ed25519", bitcoin: "taproot", "bitcoin-testnet4": "taproot",
-  xrpl: "ed25519", "xrpl-testnet": "ed25519", stellar: "ed25519", "stellar-testnet": "ed25519", aptos: "ed25519", "aptos-testnet": "ed25519", sui: "ed25519", "sui-testnet": "ed25519",
+  xrpl: "ed25519", "xrpl-testnet": "ed25519", stellar: "ed25519", "stellar-testnet": "ed25519", aptos: "ed25519", "aptos-testnet": "ed25519", sui: "ed25519", "sui-testnet": "ed25519", ton: "ed25519", "ton-testnet": "ed25519",
   ...Object.fromEntries(Object.keys(EVM_CHAIN_IDS).map((n) => [n, "ecdsa"])),
   tron: "ecdsa", "tron-nile": "ecdsa",
 };
