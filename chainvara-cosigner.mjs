@@ -1133,6 +1133,7 @@ const MPC_SUITE = {
   ...Object.fromEntries(Object.keys(EVM_CHAIN_IDS).map((n) => [n, "ecdsa"])),
   tron: "ecdsa", "tron-nile": "ecdsa",
   litecoin: "ecdsa", "litecoin-testnet": "ecdsa", dogecoin: "ecdsa",
+  cosmoshub: "ecdsa", osmosis: "ecdsa", celestia: "ecdsa", noble: "ecdsa", akash: "ecdsa", dydx: "ecdsa", "osmosis-testnet": "ecdsa", "noble-testnet": "ecdsa",
 };
 const TRON_NETWORKS = new Set(["tron", "tron-nile"]);
 const suiteOf = (suite) => (suite === "taproot" ? taproot : frost);
@@ -1319,7 +1320,7 @@ async function ecdsaKeygen(req, d, { secret, master, keys, pending, answer, reje
     }
     const fin = ecdsa.dkgFinish(state, theirs);
     keys[key] = {
-      network: p.network, suite: "ecdsa", address: UTXO_ECDSA[p.network] ? utxoAddress(p.network, fin.public_key) : TRON_NETWORKS.has(p.network) ? fin.tron_address : fin.eth_address, public_key: fin.public_key, stored_at: new Date().toISOString(),
+      network: p.network, suite: "ecdsa", address: UTXO_ECDSA[p.network] ? utxoAddress(p.network, fin.public_key) : COSMOS[p.network] ? cosmosAddress(p.network, fin.public_key) : TRON_NETWORKS.has(p.network) ? fin.tron_address : fin.eth_address, public_key: fin.public_key, stored_at: new Date().toISOString(),
       key_package: sealText(master, `mpc|${key}`, fin.party),
     };
     writeJson(F.mpc, keys);
@@ -1344,6 +1345,20 @@ async function handleEcdsaSigning(req, d, k, approved, { secret, master, pending
     delete pending[nonceId];
     writeJson(F.mpcPending, pending);
   };
+  if (req.type === "mpc.commit" && COSMOS[k.network]) {
+    // The SignDoc is decoded here; one signature per approval and account sequence (a re-sign of the same doc is fine).
+    const checked = checkCosmos(String(d.sign_doc ?? ""), k, approved);
+    if (typeof checked === "string") return reject(`The transaction does not match what was approved: ${checked}`);
+    if (approved.cosmos_sequence !== undefined && approved.cosmos_sequence !== checked.sequence) return reject("This approval was already signed with another sequence: request a new transfer.");
+    approved.cosmos_sequence = checked.sequence;
+    writeJson(F.approvals, approvals);
+    const signId = crypto.randomBytes(16).toString("hex");
+    const r = ecdsa.sign1(party(), signId, checked.hash);
+    pending[nonceId] = { at: new Date().toISOString(), suite: "ecdsa", step: 1, sign_id: signId, hash: checked.hash, state: sealText(master, `ecdsa-sign|${nonceId}`, r.state) };
+    writeJson(F.mpcPending, pending);
+    log({ type: req.type, request_id: req.request_id, key_id: d.key_id, transfer_id: d.transfer_id, signing_hash: checked.hash, decision: "commit" });
+    return answer({ action: "ok", sign_id: signId, hash: checked.hash, message: await ecdsaSeal(secret, req, r.message) });
+  }
   if (req.type === "mpc.commit" && UTXO_ECDSA[k.network]) {
     // One input per session: the co-signer recomputes every sighash of the transaction from the transaction itself
     // (and, on Dogecoin, from previous transactions whose ids it checks), then signs only input d.input's.
@@ -2171,6 +2186,128 @@ function readPrevTx(hex) {
  * `input`, or the reason to refuse: only this wallet's coins, exactly the approved amount to the approved address,
  * anything else back to this wallet, a bounded fee.
  */
+// ---------------------------------------------------------------- Cosmos SDK (bank sends, SIGN_MODE_DIRECT)
+
+/** Cosmos SDK chains: bech32 prefix, chain id, fee coin and the highest fee a send may pay (atomic units of that coin). */
+const COSMOS = {
+  cosmoshub: { prefix: "cosmos", chainId: "cosmoshub-4", denom: "uatom", maxFee: 200_000n, coin: "ATOM" },
+  osmosis: { prefix: "osmo", chainId: "osmosis-1", denom: "uosmo", maxFee: 2_000_000n, coin: "OSMO" },
+  celestia: { prefix: "celestia", chainId: "celestia", denom: "utia", maxFee: 500_000n, coin: "TIA" },
+  noble: { prefix: "noble", chainId: "noble-1", denom: "uusdc", maxFee: 1_000_000n, coin: "USDC" },
+  akash: { prefix: "akash", chainId: "akashnet-2", denom: "uakt", maxFee: 2_000_000n, coin: "AKT" },
+  dydx: { prefix: "dydx", chainId: "dydx-mainnet-1", denom: "adydx", maxFee: 2_000_000_000_000_000_000n, coin: "DYDX" },
+  "osmosis-testnet": { prefix: "osmo", chainId: "osmo-test-5", denom: "uosmo", maxFee: 2_000_000n, coin: "OSMO" },
+  "noble-testnet": { prefix: "noble", chainId: "grand-1", denom: "uusdc", maxFee: 1_000_000n, coin: "USDC" },
+};
+const COSMOS_SEND = "/cosmos.bank.v1beta1.MsgSend";
+const COSMOS_PUBKEY = "/cosmos.crypto.secp256k1.PubKey";
+
+function bech32Encode(hrp, bytes) {
+  const data = convertBits([...bytes], 8, 5, true);
+  const c = polymod([...hrpExpand(hrp), ...data, 0, 0, 0, 0, 0, 0]) ^ 1;
+  return `${hrp}1${[...data, ...Array.from({ length: 6 }, (_, i) => (c >>> (5 * (5 - i))) & 31)].map((x) => BECH32[x]).join("")}`;
+}
+
+/** bech32(prefix, RIPEMD160(SHA256(compressed public key))). */
+export function cosmosAddress(network, publicKeyHex) {
+  const c = COSMOS[network];
+  const pub = Buffer.from(String(publicKeyHex), "hex");
+  if (!c || pub.length !== 33) throw new Error("not a Cosmos key");
+  return bech32Encode(c.prefix, hash160(pub));
+}
+
+/** Strict protobuf reader: varint and length-delimited fields only, the whole input consumed. */
+function cosmosFields(buf) {
+  const out = [];
+  let i = 0;
+  const varint = () => {
+    let n = 0n;
+    for (let shift = 0n; shift < 70n; shift += 7n) {
+      if (i >= buf.length) throw new Error("truncated varint");
+      const b = buf[i++];
+      n |= BigInt(b & 0x7f) << shift;
+      if (!(b & 0x80)) return n;
+    }
+    throw new Error("varint too long");
+  };
+  while (i < buf.length) {
+    const key = varint();
+    const field = Number(key >> 3n);
+    const wire = Number(key & 7n);
+    if (field < 1) throw new Error("invalid field");
+    if (wire === 0) out.push({ field, int: varint(), bytes: null });
+    else if (wire === 2) {
+      const len = Number(varint());
+      if (i + len > buf.length) throw new Error("truncated field");
+      out.push({ field, int: null, bytes: buf.subarray(i, i + len) });
+      i += len;
+    } else throw new Error(`wire type ${wire} not expected`);
+  }
+  return out;
+}
+/** The fields of a message, each allowed number at most once, nothing else. */
+function cosmosMessage(buf, allowed) {
+  const byField = {};
+  for (const x of cosmosFields(buf)) {
+    if (!allowed.includes(x.field)) throw new Error(`unexpected field ${x.field}`);
+    if (byField[x.field]) throw new Error(`field ${x.field} repeated`);
+    byField[x.field] = [x];
+  }
+  return byField;
+}
+const cosmosText = (x) => (x ? Buffer.from(x.bytes ?? []).toString("utf8") : "");
+
+/**
+ * A Cosmos SignDoc, decoded here independently of Chainvara: one bank send of the chain's coin from this wallet to the
+ * approved destination, the approved amount and memo, no timeout or extensions, one direct-mode signer carrying this
+ * wallet's public key, a fee in the chain's coin under its cap and no fee payer or granter. Returns the signing hash.
+ */
+export function checkCosmos(signDocHex, wallet, approved) {
+  const c = COSMOS[wallet.network];
+  if (!c) return "not a Cosmos wallet";
+  if ((approved.operation ?? "transfer") !== "transfer") return "Cosmos MPC wallets sign plain sends only";
+  if (approved.asset?.contract) return `only ${c.coin} can be sent from this wallet`;
+  if (!/^([0-9a-f]{2})+$/.test(String(signDocHex))) return "unreadable sign document";
+  const doc = Buffer.from(signDocHex, "hex");
+  try {
+    const amount = approved.amount_atomic != null ? BigInt(approved.amount_atomic) : atomic(approved.amount, Number(approved.asset?.decimals ?? 6));
+    const raw = String(approved.destination ?? "");
+    const q = raw.indexOf("?");
+    const destination = q < 0 ? raw : raw.slice(0, q);
+    const params = new URLSearchParams(q < 0 ? "" : raw.slice(q + 1));
+    const memo = params.get("memo") ?? params.get("dt") ?? params.get("text") ?? "";
+    if (amount <= 0n) return "unreadable approval";
+    const d = cosmosMessage(doc, [1, 2, 3, 4]);
+    if (!d[1] || !d[2] || cosmosText(d[3]?.[0]) !== c.chainId) return `chain id is not ${c.chainId}`;
+    const body = cosmosMessage(d[1][0].bytes, [1, 2]);
+    if (!body[1]) return "the transaction carries no message";
+    const anyMsg = cosmosMessage(body[1][0].bytes, [1, 2]);
+    if (cosmosText(anyMsg[1]?.[0]) !== COSMOS_SEND || !anyMsg[2]) return "not a bank send";
+    const send = cosmosMessage(anyMsg[2][0].bytes, [1, 2, 3]);
+    const coin = cosmosMessage(send[3]?.[0]?.bytes ?? Buffer.alloc(0), [1, 2]);
+    if (cosmosText(send[1]?.[0]) !== wallet.address) return "the sender is not this wallet";
+    if (cosmosText(send[2]?.[0]) !== destination) return "recipient differs";
+    if (cosmosText(coin[1]?.[0]) !== c.denom) return `only ${c.coin} can be sent`;
+    if (!/^\d+$/.test(cosmosText(coin[2]?.[0])) || BigInt(cosmosText(coin[2]?.[0])) !== amount) return "amount differs";
+    if (cosmosText(body[2]?.[0]) !== memo) return "memo differs";
+    const auth = cosmosMessage(d[2][0].bytes, [1, 2]);
+    if (!auth[1] || !auth[2]) return "unreadable signer or fee";
+    const signer = cosmosMessage(auth[1][0].bytes, [1, 2, 3]);
+    const pkAny = cosmosMessage(signer[1]?.[0]?.bytes ?? Buffer.alloc(0), [1, 2]);
+    const pk = cosmosMessage(pkAny[2]?.[0]?.bytes ?? Buffer.alloc(0), [1]);
+    if (cosmosText(pkAny[1]?.[0]) !== COSMOS_PUBKEY || Buffer.from(pk[1]?.[0]?.bytes ?? []).toString("hex") !== String(wallet.public_key ?? "").toLowerCase()) return "the signer is not this wallet's key";
+    if (!signer[2] || Buffer.from(signer[2][0].bytes).toString("hex") !== "0a020801") return "only direct signing is accepted";
+    const fee = cosmosMessage(auth[2][0].bytes, [1, 2]);
+    const feeCoin = cosmosMessage(fee[1]?.[0]?.bytes ?? Buffer.alloc(0), [1, 2]);
+    if (cosmosText(feeCoin[1]?.[0]) !== c.denom || !/^\d+$/.test(cosmosText(feeCoin[2]?.[0]))) return "the fee is not paid in the chain's coin";
+    if (BigInt(cosmosText(feeCoin[2]?.[0])) > c.maxFee) return "network fee above the limit";
+    if ((fee[2]?.[0]?.int ?? 0n) > 2_000_000n) return "gas limit too high";
+    return { hash: sha256(doc).toString("hex"), sequence: String(signer[3]?.[0]?.int ?? 0n) };
+  } catch (e) {
+    return `unreadable transaction (${String(e?.message ?? e).slice(0, 80)})`;
+  }
+}
+
 export function checkUtxoEcdsa(txHex, prevouts, input, wallet, approved) {
   const c = UTXO_ECDSA[wallet.network];
   if (!c) return "not a Litecoin or Dogecoin wallet";
