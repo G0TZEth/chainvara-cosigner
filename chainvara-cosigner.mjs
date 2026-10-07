@@ -73,8 +73,11 @@ const DEFAULT_POLICY = {
   maxEvmFeeNative: "0.05",
   allowContractCalls: false,
   maxTronFeeLimitTrx: "50",
+  maxXrplFeeXrp: "1",
+  maxStellarFeeXlm: "1",
+  maxAptosFeeApt: "0.1",
   allowRiskySignatures: false,
-  _help: "allowRiskySignatures: let MPC EVM wallets sign off-chain permits (EIP-2612, Permit2), marketplace orders and blind 32-byte hashes; off by default because each can hand over tokens without any transaction. maxTronFeeLimitTrx: highest energy fee a TRC-20 transfer from a Tron MPC wallet may allow. allowContractCalls: let MPC EVM wallets sign arbitrary contract calls (dApps); off by default because a call can do anything (swaps, token operations and transfers are checked in detail and stay allowed). Amounts in US dollars. maxEvmFeeNative: highest network fee an EVM MPC transaction may pay, in the chain's native coin. Empty allowedNetworks / allowedDestinations = any. allowedDestinations: only these addresses (with ?dt= / ?memo= where used) can receive. humanApprovalAboveUsd: above this amount (and for unpriced assets) a person approves on this machine. Changes apply to the next request.",
+  _help: "allowRiskySignatures: let MPC EVM wallets sign off-chain permits (EIP-2612, Permit2), marketplace orders and blind 32-byte hashes; off by default because each can hand over tokens without any transaction. maxTronFeeLimitTrx: highest energy fee a TRC-20 transfer from a Tron MPC wallet may allow. maxXrplFeeXrp, maxStellarFeeXlm, maxAptosFeeApt: highest network fee of an MPC payment on the XRP Ledger, Stellar and Aptos. allowContractCalls: let MPC EVM wallets sign arbitrary contract calls (dApps); off by default because a call can do anything (swaps, token operations and transfers are checked in detail and stay allowed). Amounts in US dollars. maxEvmFeeNative: highest network fee an EVM MPC transaction may pay, in the chain's native coin. Empty allowedNetworks / allowedDestinations = any. allowedDestinations: only these addresses (with ?dt= / ?memo= where used) can receive. humanApprovalAboveUsd: above this amount (and for unpriced assets) a person approves on this machine. Changes apply to the next request.",
 };
 const APPROVAL_WINDOW_MS = 6 * 3600_000;
 // ECDSA (DKLs23) key generation messages are a few hundred KB.
@@ -350,7 +353,7 @@ async function handleMpc(req, { secret, master, policy, approvals }) {
   if (req.type === "mpc.dkg1") {
     if (keys[d.key_id]) return reject("This key already exists.");
     const suite = MPC_SUITE[String(d.network)];
-    if (!suite) return reject("MPC wallets are available on Solana, Bitcoin and EVM networks.");
+    if (!suite) return reject("MPC wallets are available on Solana, Bitcoin, XRP Ledger, Stellar, Aptos, Tron and EVM networks.");
     const r1 = suiteOf(suite).dkgRound1(COSIGNER);
     pending[d.key_id] = { network: d.network, suite, at: new Date().toISOString(), secret1: sealText(master, `mpc1|${d.key_id}`, r1.secret) };
     writeJson(F.mpcPending, pending);
@@ -373,7 +376,7 @@ async function handleMpc(req, { secret, master, policy, approvals }) {
     const r3 = suiteOf(p.suite).dkgRound3(openText(master, `mpc2|${d.key_id}`, p.secret2), VAULT, p.vault_round1, vaultRound2);
     // Taproot: the address encodes the tweaked output key; Ed25519: the group key itself.
     const publicKey = p.suite === "taproot" ? r3.output_key : r3.public_key;
-    const address = p.suite === "taproot" ? segwitEncode(BTC_HRP[p.network], 1, Buffer.from(publicKey, "hex")) : base58(Buffer.from(publicKey, "hex"));
+    const address = p.suite === "taproot" ? segwitEncode(BTC_HRP[p.network], 1, Buffer.from(publicKey, "hex")) : ed25519Address(p.network, publicKey);
     keys[d.key_id] = {
       network: p.network, suite: p.suite ?? "ed25519", address, public_key: publicKey, stored_at: new Date().toISOString(),
       key_package: sealText(master, `mpc|${d.key_id}`, r3.key_package), public_key_package: r3.public_key_package,
@@ -410,15 +413,368 @@ async function handleMpc(req, { secret, master, policy, approvals }) {
   if (!n || Date.parse(n.at) < Date.now() - 10 * 60_000) return reject("No fresh signing round for this transfer.");
   const sp = String(d.signing_package);
   const message = Buffer.from(frost.messageOf(sp), "hex");
-  const problem = checkSolanaMessage(message, k.address, approved);
-  if (problem) return reject(`The transaction does not match what was approved: ${problem}`);
-  // Two Solana transactions with different blockhashes would both be valid: one signature per approval.
-  if (approved.sol_signed_at) return reject("This approval was already signed once: request a new transfer.");
-  approved.sol_signed_at = new Date().toISOString();
+  const chain = ed25519ChainOf(k.network);
+  const checked =
+    chain === "xrpl" ? checkXrplMessage(message, k, approved, policy)
+    : chain === "stellar" ? checkStellarTransaction(d.tx, message, k, approved, policy)
+    : chain === "aptos" ? checkAptosMessage(message, k, approved, policy)
+    : { problem: checkSolanaMessage(message, k.address, approved) };
+  if (checked.problem) return reject(`The transaction does not match what was approved: ${checked.problem}`);
+  if (chain === "solana") {
+    // Two Solana transactions with different blockhashes would both be valid: one signature per approval.
+    if (approved.sol_signed_at) return reject("This approval was already signed once: request a new transfer.");
+    approved.sol_signed_at = new Date().toISOString();
+  } else {
+    // XRP Ledger, Stellar, Aptos: an account sequence number is used once on chain. Re-signing with the same one
+    // (after an expiry) is safe; another one could pay twice.
+    if (approved.ed_sequence != null && approved.ed_sequence !== checked.sequence) return reject("This approval was already signed with another sequence number (it could be paid twice): request a new transfer.");
+    approved.ed_sequence = checked.sequence;
+  }
   writeJson(F.approvals, approvals);
   const share = frost.signShare(sp, openText(master, `nonce|${nonceId}`, n.nonces), openText(master, `mpc|${d.key_id}`, k.key_package));
   log({ type: req.type, request_id: req.request_id, key_id: d.key_id, transfer_id: d.transfer_id, decision: "signed share" });
   return answer({ action: "ok", share });
+}
+
+// ---------------------------------------------------------------- XRP Ledger, Stellar, Aptos (FROST Ed25519)
+//
+// The co-signer decodes each chain's own transaction format, byte by byte, refuses any field it does not expect,
+// and compares every value with the transfer it approved. It never trusts Chainvara's description of the transaction.
+
+const ED25519_CHAINS = { xrpl: "xrpl", "xrpl-testnet": "xrpl", stellar: "stellar", "stellar-testnet": "stellar", aptos: "aptos", "aptos-testnet": "aptos" };
+const ed25519ChainOf = (network) => ED25519_CHAINS[network] ?? "solana";
+const sha256b = (b) => crypto.createHash("sha256").update(b).digest();
+const approvedAtomic = (approved, decimals) => (approved.amount_atomic != null ? BigInt(approved.amount_atomic) : atomic(approved.amount, decimals));
+const splitDestination = (raw) => {
+  const s = String(raw ?? "");
+  const i = s.indexOf("?");
+  if (i < 0) return { address: s, key: null, tag: null };
+  const q = new URLSearchParams(s.slice(i + 1));
+  const key = ["dt", "memo", "text"].find((k) => q.has(k)) ?? null;
+  return { address: s.slice(0, i), key, tag: key ? q.get(key) : null };
+};
+const isPlainTransfer = (approved) => (approved.operation ?? "transfer") === "transfer";
+
+// XRP Ledger addresses: base58 (Ripple alphabet) of 0x00 || AccountID || 4-byte double-SHA-256 checksum.
+const RIPPLE_B58 = "rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz";
+export const xrplAccountId = (pub) => crypto.createHash("ripemd160").update(sha256b(Buffer.concat([Buffer.from([0xed]), pub]))).digest();
+export function rippleEncode(accountId) {
+  const body = Buffer.concat([Buffer.from([0]), accountId]);
+  const full = Buffer.concat([body, sha256b(sha256b(body)).subarray(0, 4)]);
+  let n = BigInt(`0x${full.toString("hex")}`);
+  let out = "";
+  while (n > 0n) {
+    out = RIPPLE_B58[Number(n % 58n)] + out;
+    n /= 58n;
+  }
+  for (const b of full) {
+    if (b !== 0) break;
+    out = RIPPLE_B58[0] + out;
+  }
+  return out;
+}
+export function rippleDecode(s) {
+  let n = 0n;
+  for (const ch of String(s)) {
+    const i = RIPPLE_B58.indexOf(ch);
+    if (i < 0) return null;
+    n = n * 58n + BigInt(i);
+  }
+  let h = n.toString(16);
+  if (h.length % 2) h = `0${h}`;
+  let lead = 0;
+  for (const ch of String(s)) {
+    if (ch !== RIPPLE_B58[0]) break;
+    lead++;
+  }
+  const bytes = Buffer.concat([Buffer.alloc(lead), n === 0n ? Buffer.alloc(0) : Buffer.from(h, "hex")]);
+  if (bytes.length !== 25 || bytes[0] !== 0) return null;
+  if (!sha256b(sha256b(bytes.subarray(0, 21))).subarray(0, 4).equals(bytes.subarray(21))) return null;
+  return bytes.subarray(1, 21);
+}
+
+// Stellar StrKey (G…): base32 of version byte || 32-byte key || CRC16-XModem (little-endian).
+const B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+function crc16x(bytes) {
+  let crc = 0;
+  for (const b of bytes) {
+    crc ^= b << 8;
+    for (let i = 0; i < 8; i++) crc = crc & 0x8000 ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff;
+  }
+  return crc;
+}
+export function stellarEncode(pub) {
+  const body = Buffer.concat([Buffer.from([6 << 3]), pub]);
+  const crc = crc16x(body);
+  const data = Buffer.concat([body, Buffer.from([crc & 0xff, crc >> 8])]);
+  let bits = 0, value = 0, out = "";
+  for (const b of data) {
+    value = ((value << 8) | b) & 0xffff;
+    bits += 8;
+    while (bits >= 5) {
+      out += B32[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) out += B32[(value << (5 - bits)) & 31];
+  return out;
+}
+export function stellarDecode(s) {
+  if (!/^G[A-Z2-7]{55}$/.test(String(s))) return null;
+  let bits = 0, value = 0;
+  const out = [];
+  for (const ch of s) {
+    value = ((value << 5) | B32.indexOf(ch)) & 0xffff;
+    bits += 5;
+    if (bits >= 8) {
+      out.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  const raw = Buffer.from(out);
+  if (raw.length !== 35 || raw[0] !== 6 << 3) return null;
+  const crc = crc16x(raw.subarray(0, 33));
+  return raw[33] === (crc & 0xff) && raw[34] === crc >> 8 ? raw.subarray(1, 33) : null;
+}
+
+const aptosAddressOf = (pub) => `0x${crypto.createHash("sha3-256").update(Buffer.concat([pub, Buffer.from([0])])).digest("hex")}`;
+const aptosNorm = (a) => {
+  const h = String(a ?? "").toLowerCase().replace(/^0x/, "");
+  return /^[0-9a-f]{1,64}$/.test(h) ? h.padStart(64, "0") : null;
+};
+
+/** Address of the joint Ed25519 key on its network (checked against Chainvara's at key generation). */
+export function ed25519Address(network, publicKeyHex) {
+  const pub = Buffer.from(publicKeyHex, "hex");
+  switch (ed25519ChainOf(network)) {
+    case "xrpl": return rippleEncode(xrplAccountId(pub));
+    case "stellar": return stellarEncode(pub);
+    case "aptos": return aptosAddressOf(pub);
+    default: return base58(pub);
+  }
+}
+
+/** XRP Ledger: a signing message is "STX\0" + canonical binary fields, sorted by (type, field). Payments in XRP only. */
+const XRPL_FIELDS = {
+  [1 * 256 + 2]: "TransactionType", [2 * 256 + 2]: "Flags", [2 * 256 + 4]: "Sequence", [2 * 256 + 14]: "DestinationTag", [2 * 256 + 27]: "LastLedgerSequence",
+  [6 * 256 + 1]: "Amount", [6 * 256 + 8]: "Fee", [7 * 256 + 3]: "SigningPubKey", [8 * 256 + 1]: "Account", [8 * 256 + 3]: "Destination",
+};
+export function checkXrplMessage(message, k, approved, policy = DEFAULT_POLICY) {
+  const buf = Buffer.from(message);
+  if (buf.length < 4 || buf.readUInt32BE(0) !== 0x53545800) return { problem: "not an XRP Ledger signing message" };
+  const f = {};
+  let o = 4;
+  const rd = (n) => {
+    if (o + n > buf.length) throw new Error("truncated");
+    const v = buf.subarray(o, o + n);
+    o += n;
+    return v;
+  };
+  const vl = () => {
+    const b1 = rd(1)[0];
+    if (b1 <= 192) return b1;
+    if (b1 <= 240) return 193 + (b1 - 193) * 256 + rd(1)[0];
+    throw new Error("field too long");
+  };
+  try {
+    let last = -1;
+    while (o < buf.length) {
+      const h = rd(1)[0];
+      let type = h >> 4;
+      let field = h & 15;
+      if (type === 0) type = rd(1)[0];
+      if (field === 0) field = rd(1)[0];
+      const order = type * 256 + field;
+      if (order <= last) throw new Error("fields out of order");
+      last = order;
+      const name = XRPL_FIELDS[order];
+      if (!name) throw new Error(`unexpected field ${type}/${field}`);
+      if (type === 1) f[name] = rd(2).readUInt16BE(0);
+      else if (type === 2) f[name] = rd(4).readUInt32BE(0);
+      else if (type === 6) {
+        const a = rd(8);
+        if (a[0] & 0x80) throw new Error("issued-currency amounts are not allowed");
+        if (!(a[0] & 0x40)) throw new Error("negative amount");
+        f[name] = a.readBigUInt64BE(0) & 0x3fffffffffffffffn;
+      } else if (type === 7) f[name] = Buffer.from(rd(vl()));
+      else {
+        if (vl() !== 20) throw new Error("bad account length");
+        f[name] = Buffer.from(rd(20));
+      }
+    }
+  } catch (e) {
+    return { problem: `malformed transaction (${e.message})` };
+  }
+  for (const req of ["TransactionType", "Flags", "Sequence", "LastLedgerSequence", "Amount", "Fee", "SigningPubKey", "Account", "Destination"]) {
+    if (f[req] === undefined) return { problem: `missing ${req}` };
+  }
+  if (!isPlainTransfer(approved) || approved.asset?.contract) return { problem: "MPC wallets sign plain XRP payments only" };
+  if (f.TransactionType !== 0) return { problem: "not a payment" };
+  if (f.Flags !== 0) return { problem: "payment flags are not allowed (partial payments)" };
+  const pub = Buffer.from(k.public_key, "hex");
+  if (!f.SigningPubKey.equals(Buffer.concat([Buffer.from([0xed]), pub]))) return { problem: "signed by another key" };
+  if (!f.Account.equals(xrplAccountId(pub))) return { problem: "the sender is not this wallet" };
+  const dest = splitDestination(approved.destination);
+  const destId = rippleDecode(dest.address);
+  if (!destId || !f.Destination.equals(destId)) return { problem: "XRP goes to another address" };
+  const wantTag = dest.key === "dt" && dest.tag ? Number(dest.tag) : null;
+  if ((f.DestinationTag ?? null) !== wantTag) return { problem: "destination tag differs" };
+  if (f.Amount !== approvedAtomic(approved, 6)) return { problem: "XRP amount differs" };
+  const cap = String(policy.maxXrplFeeXrp ?? DEFAULT_POLICY.maxXrplFeeXrp);
+  if (f.Fee > atomic(cap, 6)) return { problem: `network fee above the ${cap} XRP limit (maxXrplFeeXrp)` };
+  return { problem: null, sequence: `xrpl:${f.Sequence}` };
+}
+
+/** Stellar: the unsigned TransactionEnvelope (XDR); the co-signer recomputes the signed hash from it. */
+const STELLAR_PASSPHRASE = { stellar: "Public Global Stellar Network ; September 2015", "stellar-testnet": "Test SDF Network ; September 2015" };
+export function checkStellarTransaction(txB64, message, k, approved, policy = DEFAULT_POLICY) {
+  const env = Buffer.from(String(txB64 ?? ""), "base64");
+  let o = 0;
+  const need = (n) => {
+    if (o + n > env.length) throw new Error("truncated");
+  };
+  const u32 = () => {
+    need(4);
+    const v = env.readUInt32BE(o);
+    o += 4;
+    return v;
+  };
+  const i64 = () => {
+    need(8);
+    const v = env.readBigInt64BE(o);
+    o += 8;
+    return v;
+  };
+  const bytes = (n) => {
+    need(n);
+    const v = Buffer.from(env.subarray(o, o + n));
+    o += n;
+    return v;
+  };
+  const key = () => {
+    if (u32() !== 0) throw new Error("only plain ed25519 accounts are accepted");
+    return bytes(32);
+  };
+  let t;
+  let txEnd;
+  try {
+    if (u32() !== 2) throw new Error("not a v1 transaction envelope");
+    t = { source: key(), fee: u32(), seq: i64() };
+    if (u32() !== 1) throw new Error("the transaction must have time bounds only");
+    t.minTime = i64();
+    t.maxTime = i64();
+    const memoType = u32();
+    if (memoType === 0) t.memo = null;
+    else if (memoType === 1) {
+      const len = u32();
+      if (len > 28) throw new Error("memo too long");
+      t.memo = { kind: "text", value: bytes(len).toString("utf8") };
+      bytes((4 - (len % 4)) % 4);
+    } else if (memoType === 2) t.memo = { kind: "id", value: BigInt.asUintN(64, i64()).toString() };
+    else throw new Error("only text and id memos are accepted");
+    if (u32() !== 1) throw new Error("exactly one operation is accepted");
+    if (u32() !== 0) throw new Error("operations with their own source account are not accepted");
+    const op = u32();
+    if (op === 0) {
+      const destination = key();
+      t.op = { kind: "create", destination, amount: i64() };
+    } else if (op === 1) {
+      const destination = key();
+      if (u32() !== 0) throw new Error("only XLM payments are accepted");
+      t.op = { kind: "payment", destination, amount: i64() };
+    } else throw new Error("only payments and account creation are accepted");
+    if (u32() !== 0) throw new Error("unexpected transaction extension");
+    txEnd = o;
+    if (u32() !== 0) throw new Error("the envelope already carries signatures");
+    if (o !== env.length) throw new Error("trailing bytes");
+  } catch (e) {
+    return { problem: `malformed transaction (${e.message})` };
+  }
+  const passphrase = STELLAR_PASSPHRASE[k.network];
+  if (!passphrase) return { problem: "unknown Stellar network" };
+  const hash = sha256b(Buffer.concat([sha256b(Buffer.from(passphrase)), Buffer.from([0, 0, 0, 2]), env.subarray(4, txEnd)]));
+  if (!hash.equals(Buffer.from(message))) return { problem: "the hash to sign is not the hash of this transaction" };
+  if (!isPlainTransfer(approved) || approved.asset?.contract) return { problem: "MPC wallets sign plain XLM payments only" };
+  if (!t.source.equals(Buffer.from(k.public_key, "hex"))) return { problem: "the sender is not this wallet" };
+  const dest = splitDestination(approved.destination);
+  const destKey = stellarDecode(dest.address);
+  if (!destKey || !t.op.destination.equals(destKey)) return { problem: "XLM goes to another address" };
+  if (BigInt(t.op.amount) !== approvedAtomic(approved, 7)) return { problem: "XLM amount differs" };
+  const memoOk = dest.tag ? t.memo !== null && t.memo.value === dest.tag : t.memo === null;
+  if (!memoOk) return { problem: "memo differs" };
+  const cap = String(policy.maxStellarFeeXlm ?? DEFAULT_POLICY.maxStellarFeeXlm);
+  if (BigInt(t.fee) > atomic(cap, 7)) return { problem: `network fee above the ${cap} XLM limit (maxStellarFeeXlm)` };
+  if (t.maxTime === 0n || t.maxTime > BigInt(Math.floor(Date.now() / 1000) + 86_400)) return { problem: "the transaction must expire within 24 hours" };
+  return { problem: null, sequence: `stellar:${t.seq}` };
+}
+
+/** Aptos: SHA3-256("APTOS::RawTransaction") || BCS RawTransaction calling 0x1::aptos_account. */
+const APTOS_SALT = crypto.createHash("sha3-256").update("APTOS::RawTransaction").digest();
+const APTOS_CHAIN = { aptos: 1, "aptos-testnet": 2 };
+export function checkAptosMessage(message, k, approved, policy = DEFAULT_POLICY) {
+  const buf = Buffer.from(message);
+  if (buf.length < 32 || !buf.subarray(0, 32).equals(APTOS_SALT)) return { problem: "not an Aptos transaction signing message" };
+  let o = 32;
+  const rd = (n) => {
+    if (o + n > buf.length) throw new Error("truncated");
+    const v = buf.subarray(o, o + n);
+    o += n;
+    return v;
+  };
+  const u64 = () => rd(8).readBigUInt64LE(0);
+  const uleb = () => {
+    let v = 0, shift = 0;
+    for (;;) {
+      const b = rd(1)[0];
+      v |= (b & 0x7f) << shift;
+      if (!(b & 0x80)) break;
+      shift += 7;
+      if (shift > 21) throw new Error("length too large");
+    }
+    return v;
+  };
+  const str = () => rd(uleb()).toString("utf8");
+  let t;
+  try {
+    t = { sender: rd(32).toString("hex"), seq: u64() };
+    if (uleb() !== 2) throw new Error("only entry function calls are accepted");
+    const moduleAddress = rd(32).toString("hex");
+    const moduleName = str();
+    t.fn = str();
+    if (moduleAddress !== "0".repeat(63) + "1" || moduleName !== "aptos_account") throw new Error("only 0x1::aptos_account is accepted");
+    if (uleb() !== 0) throw new Error("type arguments are not accepted");
+    const n = uleb();
+    if (n > 3) throw new Error("too many arguments");
+    t.args = [];
+    for (let i = 0; i < n; i++) t.args.push(Buffer.from(rd(uleb())));
+    t.maxGas = u64();
+    t.gasPrice = u64();
+    t.expiration = u64();
+    t.chainId = rd(1)[0];
+    if (o !== buf.length) throw new Error("trailing bytes");
+  } catch (e) {
+    return { problem: `malformed transaction (${e.message})` };
+  }
+  if (!isPlainTransfer(approved)) return { problem: "MPC wallets sign plain transfers only" };
+  if (t.chainId !== APTOS_CHAIN[k.network]) return { problem: `chain id ${t.chainId} is not ${k.network}` };
+  if (t.sender !== aptosAddressOf(Buffer.from(k.public_key, "hex")).slice(2)) return { problem: "the sender is not this wallet" };
+  const contract = approved.asset?.contract ? aptosNorm(approved.asset.contract) : null;
+  let to, amount;
+  if (!contract) {
+    if (t.fn !== "transfer" || t.args.length !== 2) return { problem: "not an APT transfer" };
+    [to, amount] = t.args;
+  } else {
+    if (t.fn !== "transfer_fungible_assets" || t.args.length !== 3) return { problem: "not a token transfer" };
+    if (t.args[0].length !== 32 || t.args[0].toString("hex") !== contract) return { problem: "token differs" };
+    [, to, amount] = t.args;
+  }
+  if (to.length !== 32 || amount.length !== 8) return { problem: "malformed transfer arguments" };
+  if (to.toString("hex") !== aptosNorm(splitDestination(approved.destination).address)) return { problem: "funds go to another address" };
+  if (amount.readBigUInt64LE(0) !== approvedAtomic(approved, contract ? Number(approved.asset?.decimals ?? 0) : 8)) return { problem: "amount differs" };
+  const cap = String(policy.maxAptosFeeApt ?? DEFAULT_POLICY.maxAptosFeeApt);
+  if (t.maxGas * t.gasPrice > atomic(cap, 8)) return { problem: `network fee above the ${cap} APT limit (maxAptosFeeApt)` };
+  if (t.expiration > BigInt(Math.floor(Date.now() / 1000) + 86_400)) return { problem: "the transaction must expire within 24 hours" };
+  return { problem: null, sequence: `aptos:${t.seq}` };
 }
 
 /**
@@ -428,6 +784,7 @@ async function handleMpc(req, { secret, master, policy, approvals }) {
 export const EVM_CHAIN_IDS = {"ethereum":1,"base":8453,"arbitrum":42161,"polygon":137,"optimism":10,"bnb":56,"avalanche":43114,"linea":59144,"zksync":324,"scroll":534352,"mantle":5000,"blast":81457,"gnosis":100,"celo":42220,"sonic":146,"unichain":130,"worldchain":480,"ink":57073,"berachain":80094,"zora":7777777,"mode":34443,"cronos":25,"kava":2222,"metis":1088,"opbnb":204,"taiko":167000,"abstract":2741,"sei":1329,"arbitrum-nova":42170,"boba":288,"lisk":1135,"bob":60808,"immutable":13371,"soneium":1868,"flare":14,"aurora":1313161554,"ronin":2020,"manta":169,"core":1116,"rootstock":30,"fantom":250,"harmony":1666600000,"xlayer":196,"plasma":9745,"monad":143,"hyperevm":999,"katana":747474,"apechain":33139,"story":1514,"sophon":50104,"ethereum-sepolia":11155111,"base-sepolia":84532,"arbitrum-sepolia":421614,"polygon-amoy":80002};
 const MPC_SUITE = {
   solana: "ed25519", "solana-devnet": "ed25519", "solana-testnet": "ed25519", bitcoin: "taproot", "bitcoin-testnet4": "taproot",
+  xrpl: "ed25519", "xrpl-testnet": "ed25519", stellar: "ed25519", "stellar-testnet": "ed25519", aptos: "ed25519", "aptos-testnet": "ed25519",
   ...Object.fromEntries(Object.keys(EVM_CHAIN_IDS).map((n) => [n, "ecdsa"])),
   tron: "ecdsa", "tron-nile": "ecdsa",
 };
