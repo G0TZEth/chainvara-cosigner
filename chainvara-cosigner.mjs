@@ -72,7 +72,8 @@ const DEFAULT_POLICY = {
   humanApprovalAboveUsd: null,
   maxEvmFeeNative: "0.05",
   allowContractCalls: false,
-  _help: "allowContractCalls: let MPC EVM wallets sign arbitrary contract calls (dApps); off by default because a call can do anything (swaps, token operations and transfers are checked in detail and stay allowed). Amounts in US dollars. maxEvmFeeNative: highest network fee an EVM MPC transaction may pay, in the chain's native coin. Empty allowedNetworks / allowedDestinations = any. allowedDestinations: only these addresses (with ?dt= / ?memo= where used) can receive. humanApprovalAboveUsd: above this amount (and for unpriced assets) a person approves on this machine. Changes apply to the next request.",
+  maxTronFeeLimitTrx: "50",
+  _help: "maxTronFeeLimitTrx: highest energy fee a TRC-20 transfer from a Tron MPC wallet may allow. allowContractCalls: let MPC EVM wallets sign arbitrary contract calls (dApps); off by default because a call can do anything (swaps, token operations and transfers are checked in detail and stay allowed). Amounts in US dollars. maxEvmFeeNative: highest network fee an EVM MPC transaction may pay, in the chain's native coin. Empty allowedNetworks / allowedDestinations = any. allowedDestinations: only these addresses (with ?dt= / ?memo= where used) can receive. humanApprovalAboveUsd: above this amount (and for unpriced assets) a person approves on this machine. Changes apply to the next request.",
 };
 const APPROVAL_WINDOW_MS = 6 * 3600_000;
 // ECDSA (DKLs23) key generation messages are a few hundred KB.
@@ -427,7 +428,9 @@ export const EVM_CHAIN_IDS = {"ethereum":1,"base":8453,"arbitrum":42161,"polygon
 const MPC_SUITE = {
   solana: "ed25519", "solana-devnet": "ed25519", "solana-testnet": "ed25519", bitcoin: "taproot", "bitcoin-testnet4": "taproot",
   ...Object.fromEntries(Object.keys(EVM_CHAIN_IDS).map((n) => [n, "ecdsa"])),
+  tron: "ecdsa", "tron-nile": "ecdsa",
 };
+const TRON_NETWORKS = new Set(["tron", "tron-nile"]);
 const suiteOf = (suite) => (suite === "taproot" ? taproot : frost);
 const BTC_HRP = { bitcoin: "bc", "bitcoin-testnet4": "tb" };
 const MAX_TAPROOT_INPUTS = 50;
@@ -487,14 +490,14 @@ async function ecdsaKeygen(req, d, { secret, master, keys, pending, answer, reje
     }
     const fin = ecdsa.dkgFinish(state, theirs);
     keys[key] = {
-      network: p.network, suite: "ecdsa", address: fin.eth_address, public_key: fin.public_key, stored_at: new Date().toISOString(),
+      network: p.network, suite: "ecdsa", address: TRON_NETWORKS.has(p.network) ? fin.tron_address : fin.eth_address, public_key: fin.public_key, stored_at: new Date().toISOString(),
       key_package: sealText(master, `mpc|${key}`, fin.party),
     };
     writeJson(F.mpc, keys);
     delete pending[key];
     writeJson(F.mpcPending, pending);
-    log({ type: req.type, request_id: req.request_id, key_id: key, network: p.network, address: fin.eth_address, decision: "mpc key created" });
-    return answer({ action: "ok", public_key: fin.public_key, address: fin.eth_address });
+    log({ type: req.type, request_id: req.request_id, key_id: key, network: p.network, address: keys[key].address, decision: "mpc key created" });
+    return answer({ action: "ok", public_key: fin.public_key, address: keys[key].address });
   } catch (e) {
     return fail(`Key generation failed: ${String(e?.message ?? e).slice(0, 160)}`);
   }
@@ -513,8 +516,12 @@ async function handleEcdsaSigning(req, d, k, approved, { secret, master, pending
     writeJson(F.mpcPending, pending);
   };
   if (req.type === "mpc.commit") {
-    const checked = checkEvmTransaction(String(d.tx ?? ""), k, approved, policy);
+    const tron = TRON_NETWORKS.has(k.network);
+    const checked = tron ? checkTronTransaction(String(d.tx ?? ""), k, approved, policy) : checkEvmTransaction(String(d.tx ?? ""), k, approved, policy);
     if (typeof checked === "string") return reject(`The transaction does not match what was approved: ${checked}`);
+    // Tron has no nonce: two transactions with different reference blocks would both be valid. One signature per approval.
+    if (tron && approved.tron_signed_at) return reject("This approval was already signed once: request a new transfer.");
+    if (tron) approved.tron_signed_at = new Date().toISOString();
     // One approval, one transaction per kind (the swap's token approval and the swap itself are two kinds): every
     // signature for it must use the same nonce, so a re-signed transaction can replace the first but never add to it.
     approved.evm_nonces ??= {};
@@ -787,6 +794,96 @@ export function checkEvmTransaction(txHex, wallet, approved, policy = DEFAULT_PO
   } catch {
     return "approved operation is not readable";
   }
+}
+
+// ---------------------------------------------------------------- Tron transaction check (independent of Chainvara)
+
+/** Protobuf fields of one message: field number → values (varint as bigint, length-delimited as Buffer). */
+function protoFields(buf) {
+  const out = new Map();
+  let pos = 0;
+  const varint = () => {
+    let v = 0n;
+    for (let shift = 0n; ; shift += 7n) {
+      if (pos >= buf.length || shift > 63n) throw new Error("bad varint");
+      const b = buf[pos++];
+      v |= BigInt(b & 0x7f) << shift;
+      if (!(b & 0x80)) return v;
+    }
+  };
+  while (pos < buf.length) {
+    const key = varint();
+    const field = Number(key >> 3n);
+    const wire = Number(key & 7n);
+    let value;
+    if (wire === 0) value = varint();
+    else if (wire === 2) {
+      const len = Number(varint());
+      if (pos + len > buf.length) throw new Error("bad length");
+      value = buf.subarray(pos, pos + len);
+      pos += len;
+    } else if (wire === 1 || wire === 5) {
+      const len = wire === 1 ? 8 : 4;
+      if (pos + len > buf.length) throw new Error("bad fixed field");
+      value = buf.subarray(pos, pos + len);
+      pos += len;
+    } else throw new Error("bad wire type");
+    out.set(field, [...(out.get(field) ?? []), value]);
+  }
+  return out;
+}
+const pbBytes = (m, n) => (Buffer.isBuffer(m.get(n)?.[0]) ? m.get(n)[0] : Buffer.alloc(0));
+const pbInt = (m, n) => (typeof m.get(n)?.[0] === "bigint" ? m.get(n)[0] : 0n);
+/** Tron base58check address → 41… hex (checksum verified). */
+export function tronHex(address) {
+  const raw = unbase58(String(address));
+  if (raw.length !== 25 || raw[0] !== 0x41) throw new Error("not a Tron address");
+  if (!sha256(sha256(raw.subarray(0, 21))).subarray(0, 4).equals(raw.subarray(21))) throw new Error("bad Tron checksum");
+  return raw.subarray(0, 21).toString("hex");
+}
+
+/**
+ * The Tron transaction is signed over raw_data (protobuf), decoded here: exactly one contract from this wallet with
+ * the default permission, no memo, an expiration in the next 24 hours, and either TRX of the approved amount to the
+ * approved address, or a TRC-20 transfer(approved address, approved amount) on the approved token with no TRX
+ * attached and a fee limit under maxTronFeeLimitTrx. Returns the signing hash (the txID, SHA-256 of raw_data).
+ */
+export function checkTronTransaction(rawHex, wallet, approved, policy = DEFAULT_POLICY) {
+  if (typeof rawHex !== "string" || !/^[0-9a-fA-F]+$/.test(rawHex) || rawHex.length % 2 || rawHex.length > 32 * 1024) return "invalid transaction encoding";
+  if (approved.network !== wallet.network) return "network differs";
+  if ((approved.operation ?? "transfer") !== "transfer") return "Tron MPC wallets sign plain transfers only";
+  const raw = Buffer.from(rawHex, "hex");
+  try {
+    const f = protoFields(raw);
+    const contracts = f.get(11) ?? [];
+    if (contracts.length !== 1) return "the transaction carries an unexpected number of contracts";
+    if (pbBytes(f, 10).length) return "the transaction carries a memo";
+    const expiration = Number(pbInt(f, 8));
+    if (expiration <= Date.now() || expiration > Date.now() + 25 * 3600_000) return "the transaction expiration is not in the next 24 hours";
+    const c = protoFields(contracts[0]);
+    if (pbInt(c, 5) !== 0n) return "the transaction uses another permission";
+    const value = protoFields(pbBytes(protoFields(pbBytes(c, 2)), 2));
+    const type = Number(pbInt(c, 1));
+    const own = tronHex(wallet.address);
+    if (pbBytes(value, 1).toString("hex") !== own) return "the transaction is not from this wallet";
+    const dest = tronHex(approved.destination);
+    const amount = approved.amount_atomic != null ? BigInt(approved.amount_atomic) : atomic(approved.amount, approved.asset?.decimals ?? 6);
+    if (!approved.asset?.contract) {
+      if (type !== 1) return "not a TRX transfer";
+      if (pbBytes(value, 2).toString("hex") !== dest) return "recipient differs";
+      if (pbInt(value, 3) !== amount) return "amount differs";
+    } else {
+      if (type !== 31) return "not a TRC-20 call";
+      if (pbBytes(value, 2).toString("hex") !== tronHex(approved.asset.contract)) return "token contract differs";
+      if (pbInt(value, 3) !== 0n || pbInt(value, 5) !== 0n) return "the token transfer carries TRX";
+      if (pbBytes(value, 4).toString("hex") !== `a9059cbb${pad(dest.slice(2))}${padInt(amount)}`) return "token transfer differs (recipient or amount)";
+      const feeCap = atomic(String(policy.maxTronFeeLimitTrx ?? DEFAULT_POLICY.maxTronFeeLimitTrx), 6);
+      if (pbInt(f, 18) > feeCap) return `fee limit above ${policy.maxTronFeeLimitTrx ?? DEFAULT_POLICY.maxTronFeeLimitTrx} TRX (maxTronFeeLimitTrx)`;
+    }
+  } catch (e) {
+    return `malformed transaction (${e.message})`;
+  }
+  return { hash: sha256(raw).toString("hex"), nonce: "tron", kind: "transfer" };
 }
 
 /**
