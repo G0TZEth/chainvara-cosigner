@@ -13,6 +13,14 @@ Your own machine gets the last word on every transfer from your Chainvara organi
 - **Fail-closed**: every request must carry Chainvara's HMAC signature (5-minute window, no replays); anything unexpected is refused, and a transfer never signs without an answer.
 - **Encrypted backups** of every key share — split keys and MPC wallets (scrypt + AES-256-GCM), with a `verify` command.
 
+## Exit plan: chainvara-recovery.mjs
+
+If Chainvara were ever unavailable, rebuild every private key yourself, offline, with Node.js 20+ and this single dependency-free file:
+
+1. `node chainvara-recovery.mjs keygen recovery-key.json` — once; paste the printed public key in Chainvara (Settings → Recovery kit).
+2. Download a recovery kit from the console (owners, with 2FA) after creating wallets; keep it with your co-signer backup.
+3. `node chainvara-recovery.mjs recover kit.json recovery-key.json cosigner-backup.json keys.json` — each key is rebuilt from Chainvara's share (sealed to your recovery key) and your co-signer's, then checked against the wallet's public key. MPC ECDSA keys come out as ordinary private keys (WIF for Bitcoin-family chains), Taproot as `tr(WIF)`, FROST Ed25519 keys as the secret scalar.
+
 ## Verify the file
 
 The SHA-256 of each release is published here **and** in your Chainvara console (Developers → API co-signer). Both must match.
