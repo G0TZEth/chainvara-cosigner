@@ -76,8 +76,9 @@ const DEFAULT_POLICY = {
   maxXrplFeeXrp: "1",
   maxStellarFeeXlm: "1",
   maxAptosFeeApt: "0.1",
+  maxSuiFeeSui: "0.5",
   allowRiskySignatures: false,
-  _help: "allowRiskySignatures: let MPC EVM wallets sign off-chain permits (EIP-2612, Permit2), marketplace orders and blind 32-byte hashes; off by default because each can hand over tokens without any transaction. maxTronFeeLimitTrx: highest energy fee a TRC-20 transfer from a Tron MPC wallet may allow. maxXrplFeeXrp, maxStellarFeeXlm, maxAptosFeeApt: highest network fee of an MPC payment on the XRP Ledger, Stellar and Aptos. allowContractCalls: let MPC EVM wallets sign arbitrary contract calls (dApps); off by default because a call can do anything (swaps, token operations and transfers are checked in detail and stay allowed). Amounts in US dollars. maxEvmFeeNative: highest network fee an EVM MPC transaction may pay, in the chain's native coin. Empty allowedNetworks / allowedDestinations = any. allowedDestinations: only these addresses (with ?dt= / ?memo= where used) can receive. humanApprovalAboveUsd: above this amount (and for unpriced assets) a person approves on this machine. Changes apply to the next request.",
+  _help: "allowRiskySignatures: let MPC EVM wallets sign off-chain permits (EIP-2612, Permit2), marketplace orders and blind 32-byte hashes; off by default because each can hand over tokens without any transaction. maxTronFeeLimitTrx: highest energy fee a TRC-20 transfer from a Tron MPC wallet may allow. maxXrplFeeXrp, maxStellarFeeXlm, maxAptosFeeApt, maxSuiFeeSui: highest network fee of an MPC payment on the XRP Ledger, Stellar, Aptos and Sui. allowContractCalls: let MPC EVM wallets sign arbitrary contract calls (dApps); off by default because a call can do anything (swaps, token operations and transfers are checked in detail and stay allowed). Amounts in US dollars. maxEvmFeeNative: highest network fee an EVM MPC transaction may pay, in the chain's native coin. Empty allowedNetworks / allowedDestinations = any. allowedDestinations: only these addresses (with ?dt= / ?memo= where used) can receive. humanApprovalAboveUsd: above this amount (and for unpriced assets) a person approves on this machine. Changes apply to the next request.",
 };
 const APPROVAL_WINDOW_MS = 6 * 3600_000;
 // ECDSA (DKLs23) key generation messages are a few hundred KB.
@@ -418,6 +419,7 @@ async function handleMpc(req, { secret, master, policy, approvals }) {
     chain === "xrpl" ? checkXrplMessage(message, k, approved, policy)
     : chain === "stellar" ? checkStellarTransaction(d.tx, message, k, approved, policy)
     : chain === "aptos" ? checkAptosMessage(message, k, approved, policy)
+    : chain === "sui" ? await checkSuiTransaction(d.tx, message, k, approved, policy)
     : { problem: checkSolanaMessage(message, k.address, approved) };
   if (checked.problem) return reject(`The transaction does not match what was approved: ${checked.problem}`);
   if (chain === "solana") {
@@ -426,7 +428,7 @@ async function handleMpc(req, { secret, master, policy, approvals }) {
     approved.sol_signed_at = new Date().toISOString();
   } else {
     // XRP Ledger, Stellar, Aptos: an account sequence number is used once on chain. Re-signing with the same one
-    // (after an expiry) is safe; another one could pay twice.
+    // (after an expiry) is safe; another one could pay twice. Sui: the same transaction digest only.
     if (approved.ed_sequence != null && approved.ed_sequence !== checked.sequence) return reject("This approval was already signed with another sequence number (it could be paid twice): request a new transfer.");
     approved.ed_sequence = checked.sequence;
   }
@@ -441,7 +443,7 @@ async function handleMpc(req, { secret, master, policy, approvals }) {
 // The co-signer decodes each chain's own transaction format, byte by byte, refuses any field it does not expect,
 // and compares every value with the transfer it approved. It never trusts Chainvara's description of the transaction.
 
-const ED25519_CHAINS = { xrpl: "xrpl", "xrpl-testnet": "xrpl", stellar: "stellar", "stellar-testnet": "stellar", aptos: "aptos", "aptos-testnet": "aptos" };
+const ED25519_CHAINS = { xrpl: "xrpl", "xrpl-testnet": "xrpl", stellar: "stellar", "stellar-testnet": "stellar", aptos: "aptos", "aptos-testnet": "aptos", sui: "sui", "sui-testnet": "sui" };
 const ed25519ChainOf = (network) => ED25519_CHAINS[network] ?? "solana";
 const sha256b = (b) => crypto.createHash("sha256").update(b).digest();
 const approvedAtomic = (approved, decimals) => (approved.amount_atomic != null ? BigInt(approved.amount_atomic) : atomic(approved.amount, decimals));
@@ -550,6 +552,7 @@ export function ed25519Address(network, publicKeyHex) {
     case "xrpl": return rippleEncode(xrplAccountId(pub));
     case "stellar": return stellarEncode(pub);
     case "aptos": return aptosAddressOf(pub);
+    case "sui": return `0x${blake2b256(Buffer.concat([Buffer.from([0]), pub])).toString("hex")}`;
     default: return base58(pub);
   }
 }
@@ -777,6 +780,140 @@ export function checkAptosMessage(message, k, approved, policy = DEFAULT_POLICY)
   return { problem: null, sequence: `aptos:${t.seq}` };
 }
 
+// ---------------------------------------------------------------- Sui (FROST Ed25519)
+//
+// The co-signer recomputes the signed digest, BLAKE2b-256(intent 0,0,0 || TransactionData), and has the exact bytes
+// simulated by Sui's public GraphQL service (not Chainvara): the only balance changes may be the approved amount
+// to the approved recipient and the network fee, under maxSuiFeeSui. One transaction per approval.
+
+const B2_IV = [0x6a09e667f3bcc908n, 0xbb67ae8584caa73bn, 0x3c6ef372fe94f82bn, 0xa54ff53a5f1d36f1n, 0x510e527fade682d1n, 0x9b05688c2b3e6c1fn, 0x1f83d9abfb41bd6bn, 0x5be0cd19137e2179n];
+const B2_SIGMA = [
+  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+  [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4], [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+  [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13], [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+  [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11], [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+  [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5], [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
+];
+const M64 = (1n << 64n) - 1n;
+const rotr64 = (x, n) => ((x >> BigInt(n)) | (x << BigInt(64 - n))) & M64;
+/** BLAKE2b-256 (RFC 7693, unkeyed). BigInt words: meant for transaction-sized inputs. */
+export function blake2b256(data) {
+  const input = Buffer.from(data);
+  const h = B2_IV.slice();
+  h[0] ^= 0x01010000n ^ 32n;
+  const blocks = Math.max(1, Math.ceil(input.length / 128));
+  for (let b = 0; b < blocks; b++) {
+    const chunk = Buffer.alloc(128);
+    input.copy(chunk, 0, b * 128, Math.min(input.length, (b + 1) * 128));
+    const m = Array.from({ length: 16 }, (_, i) => chunk.readBigUInt64LE(i * 8));
+    const v = [...h, ...B2_IV];
+    v[12] ^= BigInt(Math.min(input.length, (b + 1) * 128));
+    if (b === blocks - 1) v[14] ^= M64;
+    const G = (a, c1, c, d, x, y) => {
+      v[a] = (v[a] + v[c1] + x) & M64;
+      v[d] = rotr64(v[d] ^ v[a], 32);
+      v[c] = (v[c] + v[d]) & M64;
+      v[c1] = rotr64(v[c1] ^ v[c], 24);
+      v[a] = (v[a] + v[c1] + y) & M64;
+      v[d] = rotr64(v[d] ^ v[a], 16);
+      v[c] = (v[c] + v[d]) & M64;
+      v[c1] = rotr64(v[c1] ^ v[c], 63);
+    };
+    for (let r = 0; r < 12; r++) {
+      const x = B2_SIGMA[r % 10];
+      G(0, 4, 8, 12, m[x[0]], m[x[1]]);
+      G(1, 5, 9, 13, m[x[2]], m[x[3]]);
+      G(2, 6, 10, 14, m[x[4]], m[x[5]]);
+      G(3, 7, 11, 15, m[x[6]], m[x[7]]);
+      G(0, 5, 10, 15, m[x[8]], m[x[9]]);
+      G(1, 6, 11, 12, m[x[10]], m[x[11]]);
+      G(2, 7, 8, 13, m[x[12]], m[x[13]]);
+      G(3, 4, 9, 14, m[x[14]], m[x[15]]);
+    }
+    for (let i = 0; i < 8; i++) h[i] ^= v[i] ^ v[i + 8];
+  }
+  const out = Buffer.alloc(64);
+  h.forEach((x, i) => out.writeBigUInt64LE(x, i * 8));
+  return out.subarray(0, 32);
+}
+
+const SUI_GRAPHQL = { sui: "https://graphql.mainnet.sui.io/graphql", "sui-testnet": "https://graphql.testnet.sui.io/graphql" };
+const SUI_COIN = "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI";
+const suiNorm = (a) => `0x${String(a ?? "").toLowerCase().replace(/^0x/, "").padStart(64, "0")}`;
+const suiType = (t) => {
+  const [addr, ...rest] = String(t ?? "").split("::");
+  return [suiNorm(addr), ...rest].join("::");
+};
+
+/** Simulation by Sui's public GraphQL service: status, sender, gas budget, balance changes, digest. */
+async function suiSimulateOnline(network, bytes) {
+  const url = SUI_GRAPHQL[network];
+  if (!url) throw new Error("unknown Sui network");
+  const query = "query($tx: JSON!) { simulateTransaction(transaction: $tx, checksEnabled: true) { effects { transaction { digest transactionJson effects { status balanceChangesJson } } } } }";
+  const res = await fetch(url, {
+    method: "POST", headers: { "content-type": "application/json" }, signal: AbortSignal.timeout(15_000),
+    body: JSON.stringify({ query, variables: { tx: { bcs: { value: Buffer.from(bytes).toString("base64") } } } }),
+  });
+  const j = await res.json();
+  const t = j?.data?.simulateTransaction?.effects?.transaction;
+  if (!t) throw new Error(String(j?.errors?.[0]?.message ?? `HTTP ${res.status}`).slice(0, 160));
+  return { digest: t.digest, status: t.effects?.status, sender: t.transactionJson?.sender, budget: t.transactionJson?.gasPayment?.budget, balanceChanges: t.effects?.balanceChangesJson ?? [] };
+}
+let suiSimulate = suiSimulateOnline;
+/** Tests replace the network simulation. */
+export const setSuiSimulator = (fn) => {
+  suiSimulate = fn ?? suiSimulateOnline;
+};
+
+export async function checkSuiTransaction(txB64, message, k, approved, policy = DEFAULT_POLICY) {
+  const bytes = Buffer.from(String(txB64 ?? ""), "base64");
+  if (!bytes.length || bytes.length > 64 * 1024) return { problem: "invalid transaction encoding" };
+  if (!blake2b256(Buffer.concat([Buffer.from([0, 0, 0]), bytes])).equals(Buffer.from(message))) return { problem: "the hash to sign is not the hash of this transaction" };
+  if (!isPlainTransfer(approved)) return { problem: "MPC wallets sign plain transfers only" };
+  let sim;
+  try {
+    sim = await suiSimulate(k.network, bytes);
+  } catch (e) {
+    return { problem: `the transaction could not be simulated on Sui (${e.message})` };
+  }
+  if (sim.status !== "SUCCESS") return { problem: "Sui would reject this transaction" };
+  if (suiNorm(sim.sender) !== suiNorm(k.address)) return { problem: "the sender is not this wallet" };
+  let budget;
+  try {
+    budget = BigInt(sim.budget);
+  } catch {
+    return { problem: "unreadable gas budget" };
+  }
+  const cap = String(policy.maxSuiFeeSui ?? DEFAULT_POLICY.maxSuiFeeSui);
+  if (budget > atomic(cap, 9)) return { problem: `network fee above the ${cap} SUI limit (maxSuiFeeSui)` };
+  const type = approved.asset?.contract ? suiType(approved.asset.contract) : SUI_COIN;
+  const amount = approvedAtomic(approved, approved.asset?.contract ? Number(approved.asset?.decimals ?? 0) : 9);
+  const to = suiNorm(splitDestination(approved.destination).address);
+  const own = suiNorm(k.address);
+  let received = false;
+  for (const c of sim.balanceChanges) {
+    const owner = suiNorm(c.address);
+    const coin = suiType(c.coinType);
+    const amt = BigInt(c.amount);
+    if (owner === to && coin === type) {
+      if (amt !== amount) return { problem: "amount differs" };
+      received = true;
+      continue;
+    }
+    if (owner === own) {
+      if (coin === type && type !== SUI_COIN && amt === -amount) continue;
+      if (coin === SUI_COIN) {
+        const spent = -amt - (type === SUI_COIN ? amount : 0n);
+        if (spent < 0n || spent > budget) return { problem: "the transaction moves more SUI than the transfer and its fee" };
+        continue;
+      }
+    }
+    return { problem: "the transaction moves other funds" };
+  }
+  if (!received) return { problem: "funds go to another address" };
+  return { problem: null, sequence: `sui:${sim.digest}` };
+}
+
 /**
  * EVM networks and their chain ids, kept here so the co-signer knows on its own which chain a transaction targets
  * (a signature for another chain id could be replayed there). A test keeps this list equal to Chainvara's registry.
@@ -784,7 +921,7 @@ export function checkAptosMessage(message, k, approved, policy = DEFAULT_POLICY)
 export const EVM_CHAIN_IDS = {"ethereum":1,"base":8453,"arbitrum":42161,"polygon":137,"optimism":10,"bnb":56,"avalanche":43114,"linea":59144,"zksync":324,"scroll":534352,"mantle":5000,"blast":81457,"gnosis":100,"celo":42220,"sonic":146,"unichain":130,"worldchain":480,"ink":57073,"berachain":80094,"zora":7777777,"mode":34443,"cronos":25,"kava":2222,"metis":1088,"opbnb":204,"taiko":167000,"abstract":2741,"sei":1329,"arbitrum-nova":42170,"boba":288,"lisk":1135,"bob":60808,"immutable":13371,"soneium":1868,"flare":14,"aurora":1313161554,"ronin":2020,"manta":169,"core":1116,"rootstock":30,"fantom":250,"harmony":1666600000,"xlayer":196,"plasma":9745,"monad":143,"hyperevm":999,"katana":747474,"apechain":33139,"story":1514,"sophon":50104,"ethereum-sepolia":11155111,"base-sepolia":84532,"arbitrum-sepolia":421614,"polygon-amoy":80002};
 const MPC_SUITE = {
   solana: "ed25519", "solana-devnet": "ed25519", "solana-testnet": "ed25519", bitcoin: "taproot", "bitcoin-testnet4": "taproot",
-  xrpl: "ed25519", "xrpl-testnet": "ed25519", stellar: "ed25519", "stellar-testnet": "ed25519", aptos: "ed25519", "aptos-testnet": "ed25519",
+  xrpl: "ed25519", "xrpl-testnet": "ed25519", stellar: "ed25519", "stellar-testnet": "ed25519", aptos: "ed25519", "aptos-testnet": "ed25519", sui: "ed25519", "sui-testnet": "ed25519",
   ...Object.fromEntries(Object.keys(EVM_CHAIN_IDS).map((n) => [n, "ecdsa"])),
   tron: "ecdsa", "tron-nile": "ecdsa",
 };
