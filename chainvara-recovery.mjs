@@ -13,6 +13,11 @@
  *   node chainvara-recovery.mjs keygen <recovery-key.json>         create your recovery key (once; keep it offline)
  *   node chainvara-recovery.mjs inspect <kit.json>                  list the wallets in a kit (no secret needed)
  *   node chainvara-recovery.mjs recover <kit.json> <recovery-key.json> <cosigner-backup.json> <out.json>
+ *   node chainvara-recovery.mjs recover-cosigner <cosigner-backup.json> <recovery-key.json> <out.json>
+ *       wallets with a backup share (2-of-3) only: rebuilt from your co-signer backup and its backup shares, no kit
+ *
+ * A wallet created with a backup share (2-of-3) needs any two of: Chainvara's share (in the kit), the co-signer's
+ * share (in its backup) and the backup share (sealed to your recovery key, in both the kit and the co-signer backup).
  *
  * The output file holds plain private keys: write it to an encrypted disk, import what you need, then destroy it.
  */
@@ -138,8 +143,27 @@ export function edSignWithScalar(scalarLeHex, message) {
 
 // ---------------------------------------------------------------- share recombination (2-of-2, participants 1 and 2)
 
-/** Lagrange coefficients at 0 for participants 1 and 2: λ1 = 2, λ2 = −1. */
-const lagrange = (s1, s2, n) => mod(2n * s1 - s2, n);
+function invMod(a, m) {
+  let [r0, r1, s0, s1] = [mod(a, m), m, 1n, 0n];
+  while (r1 !== 0n) {
+    const q = r0 / r1;
+    [r0, r1, s0, s1] = [r1, r0 - q * r1, s1, s0 - q * s1];
+  }
+  if (r0 !== 1n) throw new Error("not invertible");
+  return mod(s0, m);
+}
+
+/** Secret at 0 from two Shamir shares of participants i and j (for 1 and 2: 2·s1 − s2). */
+const lagrange = (a, b, n) => mod(a.share * b.id * invMod(b.id - a.id, n) + b.share * a.id * invMod(a.id - b.id, n), n);
+
+/** One participant's share of an MPC key (ECDSA party JSON, or a FROST key package). */
+function mpcShare(material, suite) {
+  if (suite === "ecdsa") {
+    const p = JSON.parse(material.party ?? material.key_package);
+    return { id: BigInt(p.party_index), share: beToBig(Buffer.from(p.poly_point, "hex")) };
+  }
+  return frostShare(material.key_package, suite);
+}
 
 /** FROST key package (binary, frost-core 3): 5-byte header, identifier, signing share, verifying share, verifying key. */
 function frostShare(keyPackageHex, suite) {
@@ -152,7 +176,7 @@ function frostShare(keyPackageHex, suite) {
  * Rebuilds one wallet's private key from Chainvara's material (vault) and the co-signer's (backup entry), and checks it
  * against the wallet's public key. Returns { kind, secretHex, publicKey } or throws.
  */
-export function rebuildKey(wallet, vault, cosigner) {
+export function rebuildKey(wallet, vault, cosigner, backup = null) {
   const mode = wallet.share_mode;
   if (mode === "single") {
     return checked(wallet, wallet.curve === "ed25519" ? "ed25519-seed" : "secp256k1", Buffer.from(vault.secret, "base64"));
@@ -164,19 +188,19 @@ export function rebuildKey(wallet, vault, cosigner) {
     return checked(wallet, wallet.curve === "ed25519" ? "ed25519-seed" : "secp256k1", Buffer.from(a.map((x, i) => x ^ b[i])));
   }
   if (mode === "mpc_cosigner") {
-    if (!cosigner?.key_package) throw new Error("the co-signer backup has no MPC share for this key");
-    if (vault.suite === "ecdsa") {
-      const v = JSON.parse(vault.party), c = JSON.parse(cosigner.key_package);
-      const byId = { [v.party_index]: beToBig(Buffer.from(v.poly_point, "hex")), [c.party_index]: beToBig(Buffer.from(c.poly_point, "hex")) };
-      if (byId[1] === undefined || byId[2] === undefined) throw new Error("the two ECDSA shares are not participants 1 and 2");
-      return checked(wallet, "secp256k1", bigToBe(lagrange(byId[1], byId[2], SECP_N)));
+    // Any two distinct participants: 1 = Chainvara (kit), 2 = co-signer (its backup), 3 = backup share (2-of-3 keys).
+    const materials = [vault, cosigner?.key_package ? cosigner : null, backup].filter(Boolean);
+    const suite = materials.some((m) => m.suite === "ecdsa") ? "ecdsa" : materials.some((m) => m.suite === "taproot") ? "taproot" : "ed25519";
+    const shares = [];
+    for (const m of materials) {
+      const sh = mpcShare(m, suite);
+      if (!shares.some((x) => x.id === sh.id)) shares.push(sh);
     }
-    const suite = vault.suite === "taproot" || cosigner.suite === "taproot" ? "taproot" : "ed25519";
-    const v = frostShare(vault.key_package, suite), c = frostShare(cosigner.key_package, suite);
-    const byId = { [v.id]: v.share, [c.id]: c.share };
-    if (byId[1n] === undefined || byId[2n] === undefined) throw new Error("the two FROST shares are not participants 1 and 2");
-    if (suite === "taproot") return checked(wallet, "taproot", bigToBe(lagrange(byId[1n], byId[2n], SECP_N)));
-    return checked(wallet, "ed25519-scalar", bigToLe(lagrange(byId[1n], byId[2n], L)));
+    if (shares.length < 2) throw new Error(cosigner?.key_package || backup ? "two different shares are needed" : "the co-signer backup has no MPC share for this key");
+    const [a, b] = shares;
+    if (suite === "ecdsa") return checked(wallet, "secp256k1", bigToBe(lagrange(a, b, SECP_N)));
+    if (suite === "taproot") return checked(wallet, "taproot", bigToBe(lagrange(a, b, SECP_N)));
+    return checked(wallet, "ed25519-scalar", bigToLe(lagrange(a, b, L)));
   }
   throw new Error(`share mode ${mode} is not recoverable with this kit`);
 }
@@ -251,10 +275,33 @@ export function recoverAll(kit, recoveryPrivateRaw, backupContent) {
     try {
       const vault = JSON.parse(openForRecovery(recoveryPrivateRaw, w.sealed, `${kit.organization_id}|${w.key_id}`).toString("utf8"));
       const cos = w.share_mode === "split_cosigner" ? backupContent?.split?.[w.key_id] : w.share_mode === "mpc_cosigner" ? backupContent?.mpc?.[w.key_id] : null;
-      const r = rebuildKey(w, vault, cos);
+      // 2-of-3: the backup share in the kit (or in the co-signer backup) stands in for a missing co-signer share.
+      const sealedBackup = w.backup_share ?? cos?.backup_share ?? null;
+      const backup = sealedBackup ? JSON.parse(openForRecovery(recoveryPrivateRaw, sealedBackup, `backup|${w.key_id}`).toString("utf8")) : null;
+      const r = rebuildKey(w, vault, w.share_mode === "mpc_cosigner" && !cos?.key_package ? null : cos, backup);
       out.push({ wallet_id: w.wallet_id, label: w.label, network: w.network, address: w.address, public_key: r.publicKey, key_kind: r.kind, ...formats(w.network, r) });
     } catch (e) {
       out.push({ wallet_id: w.wallet_id, label: w.label, network: w.network, address: w.address, error: String(e?.message ?? e) });
+    }
+  }
+  return out;
+}
+
+/**
+ * Without a kit (Chainvara gone and no kit exported): every 2-of-3 wallet of a co-signer backup is rebuilt from the
+ * co-signer's share and the backup share stored next to it, sealed to the recovery key.
+ */
+export function recoverFromCosigner(backupContent, recoveryPrivateRaw) {
+  const out = [];
+  for (const [keyId, m] of Object.entries(backupContent?.mpc ?? {})) {
+    if (!m.backup_share) continue;
+    const wallet = { network: m.network, address: m.address, public_key: m.public_key, share_mode: "mpc_cosigner" };
+    try {
+      const backup = JSON.parse(openForRecovery(recoveryPrivateRaw, m.backup_share, `backup|${keyId}`).toString("utf8"));
+      const r = rebuildKey(wallet, backup, m);
+      out.push({ key_id: keyId, network: m.network, address: m.address, public_key: r.publicKey, key_kind: r.kind, ...formats(m.network, r) });
+    } catch (e) {
+      out.push({ key_id: keyId, network: m.network, address: m.address, error: String(e?.message ?? e) });
     }
   }
   return out;
@@ -349,7 +396,20 @@ async function main([cmd, ...args]) {
     for (const w of bad) console.log(`  not recovered: ${w.network} ${w.address}: ${w.error}`);
     return;
   }
-  console.log("Commands: keygen <file> · inspect <kit> · recover <kit> <recovery-key> <cosigner-backup> <out>");
+  if (cmd === "recover-cosigner") {
+    const [backupFile, keyFile, outFile] = args;
+    if (!outFile) throw new Error("Usage: recover-cosigner <cosigner-backup.json> <recovery-key.json> <out.json>");
+    const backup = openCosignerBackup(JSON.parse(fs.readFileSync(backupFile, "utf8")), await ask("Co-signer backup passphrase: ", true));
+    const priv = openRecoveryKey(JSON.parse(fs.readFileSync(keyFile, "utf8")), await ask("Recovery key passphrase: ", true));
+    const out = recoverFromCosigner(backup, priv);
+    priv.fill(0);
+    fs.writeFileSync(outFile, JSON.stringify({ warning: "PLAIN PRIVATE KEYS. Import what you need, then destroy this file.", recovered_at: new Date().toISOString(), wallets: out }, null, 2), { mode: 0o600 });
+    const bad = out.filter((w) => w.error);
+    console.log(`${out.length - bad.length} of ${out.length} key(s) with a backup share rebuilt and checked → ${outFile}`);
+    for (const w of bad) console.log(`  not recovered: ${w.network} ${w.address}: ${w.error}`);
+    return;
+  }
+  console.log("Commands: keygen <file> · inspect <kit> · recover <kit> <recovery-key> <cosigner-backup> <out> · recover-cosigner <cosigner-backup> <recovery-key> <out>");
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === fs.realpathSync(process.argv[1])) {
