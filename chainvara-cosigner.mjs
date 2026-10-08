@@ -486,10 +486,20 @@ async function handleMpc(req, { secret, master, policy, approvals }) {
   if (k.network !== d.network || k.address !== d.address) return reject("The MPC share does not belong to that wallet.");
   const approved = approvals.find((a) => a.transfer_id === d.transfer_id && a.intent_hash === d.intent_hash && Date.parse(a.at) > Date.now() - APPROVAL_WINDOW_MS);
   if (!approved) return reject("This co-signer has not approved that transfer.");
+  // A batched Bitcoin, Litecoin or Dogecoin payment: one transaction paying several transfers, each approved here.
+  let group = [approved];
+  if (d.batch !== undefined) {
+    if (!(k.suite === "taproot" || UTXO_ECDSA[k.network])) return reject("Only Bitcoin, Litecoin and Dogecoin payments can be batched.");
+    if (!Array.isArray(d.batch) || d.batch.length < 1 || d.batch.length > MAX_UTXO_BATCH) return reject(`A batch pays 1 to ${MAX_UTXO_BATCH} approved transfers.`);
+    const ids = d.batch.map((b) => String(b?.transfer_id ?? ""));
+    if (new Set(ids).size !== ids.length || !ids.includes(String(d.transfer_id))) return reject("The batch must list distinct transfers, including the one being signed.");
+    group = d.batch.map((b) => approvals.find((a) => a.transfer_id === String(b?.transfer_id ?? "") && a.intent_hash === String(b?.intent_hash ?? "") && Date.parse(a.at) > Date.now() - APPROVAL_WINDOW_MS));
+    if (group.some((a) => !a)) return reject("This co-signer has not approved every transfer of the batch.");
+  }
   const nonceId = `${d.key_id}|${d.transfer_id}`;
-  if (k.suite === "ecdsa") return handleEcdsaSigning(req, d, k, approved, { secret, master, pending, answer, reject, nonceId, policy, approvals });
+  if (k.suite === "ecdsa") return handleEcdsaSigning(req, d, k, approved, { secret, master, pending, answer, reject, nonceId, policy, approvals, group });
   if (req.type === "mpc.sign3") return reject("Unexpected signing step for this wallet.");
-  if (k.suite === "taproot") return handleTaprootSigning(req, d, k, approved, { master, pending, answer, reject, nonceId, approvals });
+  if (k.suite === "taproot") return handleTaprootSigning(req, d, k, approved, { master, pending, answer, reject, nonceId, approvals, group });
   if (req.type === "mpc.commit") {
     const c = frost.commit(openText(master, `mpc|${d.key_id}`, k.key_package));
     pending[nonceId] = { at: new Date().toISOString(), nonces: sealText(master, `nonce|${nonceId}`, c.nonces) };
@@ -1427,7 +1437,7 @@ async function ecdsaKeygen(req, d, { secret, master, keys, pending, answer, reje
  * (it chooses the session id); mpc.sign and mpc.sign3 carry Chainvara's next messages. The hash cannot change after
  * mpc.commit, and the session is single use.
  */
-async function handleEcdsaSigning(req, d, k, approved, { secret, master, pending, answer, reject, nonceId, policy, approvals }) {
+async function handleEcdsaSigning(req, d, k, approved, { secret, master, pending, answer, reject, nonceId, policy, approvals, group = [approved] }) {
   const party = () => openText(master, `mpc|${d.key_id}`, k.key_package);
   const drop = () => {
     delete pending[nonceId];
@@ -1450,11 +1460,11 @@ async function handleEcdsaSigning(req, d, k, approved, { secret, master, pending
   if (req.type === "mpc.commit" && UTXO_ECDSA[k.network]) {
     // One input per session: the co-signer recomputes every sighash of the transaction from the transaction itself
     // (and, on Dogecoin, from previous transactions whose ids it checks), then signs only input d.input's.
-    const checked = checkUtxoEcdsa(String(d.tx ?? ""), d.prevouts, Number(d.input), k, approved);
+    const checked = checkUtxoEcdsa(String(d.tx ?? ""), d.prevouts, Number(d.input), k, approved, group);
     if (typeof checked === "string") return reject(`The transaction does not match what was approved: ${checked}`);
     const outpoints = [...checked.outpoints].sort().join(",");
-    if (approved.btc_outpoints && approved.btc_outpoints !== outpoints) return reject("This approval was already signed spending other coins: request a new transfer.");
-    approved.btc_outpoints = outpoints;
+    if (group.some((a) => a.btc_outpoints && a.btc_outpoints !== outpoints)) return reject("This approval was already signed spending other coins: request a new transfer.");
+    for (const a of group) a.btc_outpoints = outpoints;
     writeJson(F.approvals, approvals);
     const signId = crypto.randomBytes(16).toString("hex");
     const r = ecdsa.sign1(party(), signId, checked.hash);
@@ -1958,7 +1968,7 @@ export function checkTronTransaction(rawHex, wallet, approved, policy = DEFAULT_
  * mpc.sign { tx, prevouts, signing_packages } → the co-signer rebuilds every BIP-341 sighash from the unsigned
  * transaction and the spent outputs, checks the transaction against the approval, and signs only those sighashes.
  */
-async function handleTaprootSigning(req, d, k, approved, { master, pending, answer, reject, nonceId, approvals }) {
+async function handleTaprootSigning(req, d, k, approved, { master, pending, answer, reject, nonceId, approvals, group = [approved] }) {
   if (req.type === "mpc.commit") {
     const n = Number(d.inputs);
     if (!Number.isInteger(n) || n < 1 || n > MAX_TAPROOT_INPUTS) return reject("Invalid number of inputs.");
@@ -1976,12 +1986,12 @@ async function handleTaprootSigning(req, d, k, approved, { master, pending, answ
   if (!n?.nonces || Date.parse(n.at) < Date.now() - 10 * 60_000) return reject("No fresh signing round for this transfer.");
   const packages = Array.isArray(d.signing_packages) ? d.signing_packages.map(String) : [];
   if (packages.length !== n.inputs) return reject("One signing package per input is required.");
-  const checked = checkBitcoinTaproot(String(d.tx ?? ""), d.prevouts, k, approved);
+  const checked = checkBitcoinTaproot(String(d.tx ?? ""), d.prevouts, k, approved, group);
   if (typeof checked === "string") return reject(`The transaction does not match what was approved: ${checked}`);
   if (checked.length !== packages.length) return reject("The transaction has a different number of inputs.");
   const outpoints = [...checked.outpoints].sort().join(",");
-  if (approved.btc_outpoints && approved.btc_outpoints !== outpoints) return reject("This approval was already signed spending other coins: request a new transfer.");
-  approved.btc_outpoints = outpoints;
+  if (group.some((a) => a.btc_outpoints && a.btc_outpoints !== outpoints)) return reject("This approval was already signed spending other coins: request a new transfer.");
+  for (const a of group) a.btc_outpoints = outpoints;
   writeJson(F.approvals, approvals);
   for (const [i, sp] of packages.entries()) {
     if (taproot.messageOf(sp) !== checked[i]) return reject(`Input ${i + 1}: the signing package is not over this transaction.`);
@@ -2139,14 +2149,10 @@ const MAX_FEE_SATS = 500_000n;
  * approved address, sends anything else back to this wallet, and the fee is bounded. The spent amounts are part of
  * every sighash, so lying about them only yields signatures the network rejects: the fee computed here is the real one.
  */
-export function checkBitcoinTaproot(txHex, prevouts, wallet, approved) {
-  if ((approved.operation ?? "transfer") !== "transfer") return "MPC wallets sign plain transfers only";
-  if (approved.asset?.contract) return "only BTC can be sent from this wallet";
+export function checkBitcoinTaproot(txHex, prevouts, wallet, approved, group = [approved]) {
   const own = bitcoinScript(wallet.address, wallet.network);
-  const dest = bitcoinScript(String(approved.destination ?? ""), wallet.network);
-  const amount = toSats(approved.amount, Number(approved.asset?.decimals ?? 8));
-  if (!own || !dest || amount === null || amount <= 0n) return "unreadable approval";
-  if (dest.equals(own)) return "the destination is this wallet";
+  const expected = utxoExpected(group, (a) => bitcoinScript(String(a.destination ?? ""), wallet.network), own, "BTC");
+  if (typeof expected === "string") return expected;
   let tx;
   try {
     tx = readTx(txHex);
@@ -2161,18 +2167,8 @@ export function checkBitcoinTaproot(txHex, prevouts, wallet, approved) {
     return "unreadable spent outputs";
   }
   if (spent.some((p) => !p.script.equals(own) || p.value <= 0n)) return "it spends coins that do not belong to this wallet";
-  let paid = 0n;
-  let out = 0n;
-  // Cancellation by replace-by-fee: everything back to this wallet, spending exactly the coins this approval already
-  // signed — the two versions then conflict, and at most one is ever included.
-  const cancel = tx.outs.length > 0 && tx.outs.every((o) => o.script.equals(own));
-  if (cancel && approved.btc_outpoints !== tx.ins.map((i) => i.outpoint.toString("hex")).sort().join(",")) return "a cancellation must spend exactly the coins this approval already signed";
-  for (const o of tx.outs) {
-    out += o.value;
-    if (o.script.equals(dest)) paid += o.value;
-    else if (!o.script.equals(own)) return "it pays an address that was not approved";
-  }
-  if (!cancel && (paid !== amount || tx.outs.filter((o) => o.script.equals(dest)).length !== 1)) return `it does not send exactly ${approved.amount} to the approved address`;
+  const out = utxoOutputsMatch(tx, own, expected);
+  if (typeof out === "string") return out;
   const fee = spent.reduce((a, p) => a + p.value, 0n) - out;
   if (fee < 0n) return "outputs exceed inputs";
   if (fee > MAX_FEE_SATS) return `the fee (${fee} sats) is above the co-signer limit`;
@@ -2188,6 +2184,50 @@ export function checkBitcoinTaproot(txHex, prevouts, wallet, approved) {
   // The coins spent, so a second signature for the same approval can only conflict with the first, never add to it.
   sighashes.outpoints = tx.ins.map((i) => i.outpoint.toString("hex"));
   return sighashes;
+}
+
+// ---------------------------------------------------------------- UTXO payments: approvals against outputs
+
+/** Transfers one Bitcoin-family transaction may pay at most (a payout batch is split into transactions of this size). */
+const MAX_UTXO_BATCH = 250;
+
+/** What a UTXO transaction must pay: one output per approved transfer (destination script, exact amount). */
+function utxoExpected(group, scriptOf, own, coin) {
+  const expected = [];
+  for (const a of group) {
+    if ((a.operation ?? "transfer") !== "transfer") return "MPC wallets sign plain transfers only";
+    if (a.asset?.contract) return `only ${coin} can be sent from this wallet`;
+    const script = scriptOf(a);
+    const amount = toSats(a.amount, Number(a.asset?.decimals ?? 8));
+    if (!own || !script || amount === null || amount <= 0n) return "unreadable approval";
+    if (script.equals(own)) return "the destination is this wallet";
+    expected.push({ script, amount, approved: a });
+  }
+  return expected;
+}
+
+/**
+ * The outputs against the approvals: every approved payment exactly once at its amount, change only back to this
+ * wallet. Or a replace-by-fee cancellation: everything back to this wallet, spending exactly the coins these approvals
+ * already signed — the two versions then conflict, and at most one is ever included. Returns the total paid out.
+ */
+function utxoOutputsMatch(tx, own, expected) {
+  const out = tx.outs.reduce((a, o) => a + o.value, 0n);
+  if (tx.outs.length > 0 && tx.outs.every((o) => o.script.equals(own))) {
+    const outpoints = tx.ins.map((i) => i.outpoint.toString("hex")).sort().join(",");
+    if (expected.some((e) => e.approved.btc_outpoints !== outpoints)) return "a cancellation must spend exactly the coins this approval already signed";
+    return out;
+  }
+  const exactly = expected.length === 1 ? `it does not send exactly ${expected[0].approved.amount} to the approved address` : "it does not pay every approved transfer exactly once, at its amount";
+  const left = [...expected];
+  for (const o of tx.outs) {
+    if (o.script.equals(own)) continue;
+    const i = left.findIndex((e) => e.script.equals(o.script) && e.amount === o.value);
+    if (i >= 0) left.splice(i, 1);
+    else if (expected.some((e) => e.script.equals(o.script))) return exactly;
+    else return "it pays an address that was not approved";
+  }
+  return left.length ? exactly : out;
 }
 
 // ---------------------------------------------------------------- Litecoin and Dogecoin check (independent of Chainvara)
@@ -2443,16 +2483,12 @@ export function checkCosmos(signDocHex, wallet, approved) {
   }
 }
 
-export function checkUtxoEcdsa(txHex, prevouts, input, wallet, approved) {
+export function checkUtxoEcdsa(txHex, prevouts, input, wallet, approved, group = [approved]) {
   const c = UTXO_ECDSA[wallet.network];
   if (!c) return "not a Litecoin or Dogecoin wallet";
-  if ((approved.operation ?? "transfer") !== "transfer") return "MPC wallets sign plain transfers only";
-  if (approved.asset?.contract) return `only ${c.coin} can be sent from this wallet`;
   const own = utxoScript(wallet.address, wallet.network);
-  const dest = utxoScript(String(approved.destination ?? ""), wallet.network);
-  const amount = toSats(approved.amount, Number(approved.asset?.decimals ?? 8));
-  if (!own || !dest || amount === null || amount <= 0n) return "unreadable approval";
-  if (dest.equals(own)) return "the destination is this wallet";
+  const expected = utxoExpected(group, (a) => utxoScript(String(a.destination ?? ""), wallet.network), own, c.coin);
+  if (typeof expected === "string") return expected;
   let tx;
   try {
     tx = readTx(txHex);
@@ -2476,18 +2512,8 @@ export function checkUtxoEcdsa(txHex, prevouts, input, wallet, approved) {
     return `unreadable spent outputs (${e.message})`;
   }
   if (spent.some((p) => !p.script.equals(own) || p.value <= 0n)) return "it spends coins that do not belong to this wallet";
-  let paid = 0n;
-  let out = 0n;
-  // Cancellation by replace-by-fee: everything back to this wallet, spending exactly the coins this approval already
-  // signed — the two versions then conflict, and at most one is ever included.
-  const cancel = tx.outs.length > 0 && tx.outs.every((o) => o.script.equals(own));
-  if (cancel && approved.btc_outpoints !== tx.ins.map((i) => i.outpoint.toString("hex")).sort().join(",")) return "a cancellation must spend exactly the coins this approval already signed";
-  for (const o of tx.outs) {
-    out += o.value;
-    if (o.script.equals(dest)) paid += o.value;
-    else if (!o.script.equals(own)) return "it pays an address that was not approved";
-  }
-  if (!cancel && (paid !== amount || tx.outs.filter((o) => o.script.equals(dest)).length !== 1)) return `it does not send exactly ${approved.amount} to the approved address`;
+  const out = utxoOutputsMatch(tx, own, expected);
+  if (typeof out === "string") return out;
   const fee = spent.reduce((a, p) => a + p.value, 0n) - out;
   if (fee < 0n) return "outputs exceed inputs";
   if (fee > c.maxFee) return `the fee (${fee}) is above the co-signer limit`;
