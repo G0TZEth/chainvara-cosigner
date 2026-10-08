@@ -2296,6 +2296,10 @@ const COSMOS = {
   "noble-testnet": { prefix: "noble", chainId: "grand-1", denom: "uusdc", maxFee: 1_000_000n, coin: "USDC" },
 };
 const COSMOS_SEND = "/cosmos.bank.v1beta1.MsgSend";
+const COSMOS_DELEGATE = "/cosmos.staking.v1beta1.MsgDelegate";
+const COSMOS_UNDELEGATE = "/cosmos.staking.v1beta1.MsgUndelegate";
+const COSMOS_WITHDRAW_REWARD = "/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward";
+const COSMOS_STAKING_OPS = new Set(["delegate", "undelegate", "claim_rewards"]);
 const COSMOS_PUBKEY = "/cosmos.crypto.secp256k1.PubKey";
 
 function bech32Encode(hrp, bytes) {
@@ -2361,7 +2365,8 @@ const cosmosText = (x) => (x ? Buffer.from(x.bytes ?? []).toString("utf8") : "")
 export function checkCosmos(signDocHex, wallet, approved) {
   const c = COSMOS[wallet.network];
   if (!c) return "not a Cosmos wallet";
-  if ((approved.operation ?? "transfer") !== "transfer") return "Cosmos MPC wallets sign plain sends only";
+  const op = approved.operation ?? "transfer";
+  if (op !== "transfer" && !COSMOS_STAKING_OPS.has(op)) return "Cosmos MPC wallets sign sends and staking (delegate, undelegate, claim rewards) only";
   if (approved.asset?.contract) return `only ${c.coin} can be sent from this wallet`;
   if (!/^([0-9a-f]{2})+$/.test(String(signDocHex))) return "unreadable sign document";
   const doc = Buffer.from(signDocHex, "hex");
@@ -2372,20 +2377,50 @@ export function checkCosmos(signDocHex, wallet, approved) {
     const destination = q < 0 ? raw : raw.slice(0, q);
     const params = new URLSearchParams(q < 0 ? "" : raw.slice(q + 1));
     const memo = params.get("memo") ?? params.get("dt") ?? params.get("text") ?? "";
-    if (amount <= 0n) return "unreadable approval";
+    if (amount <= 0n && op !== "claim_rewards") return "unreadable approval";
     const d = cosmosMessage(doc, [1, 2, 3, 4]);
     if (!d[1] || !d[2] || cosmosText(d[3]?.[0]) !== c.chainId) return `chain id is not ${c.chainId}`;
-    const body = cosmosMessage(d[1][0].bytes, [1, 2]);
-    if (!body[1]) return "the transaction carries no message";
-    const anyMsg = cosmosMessage(body[1][0].bytes, [1, 2]);
-    if (cosmosText(anyMsg[1]?.[0]) !== COSMOS_SEND || !anyMsg[2]) return "not a bank send";
-    const send = cosmosMessage(anyMsg[2][0].bytes, [1, 2, 3]);
-    const coin = cosmosMessage(send[3]?.[0]?.bytes ?? Buffer.alloc(0), [1, 2]);
-    if (cosmosText(send[1]?.[0]) !== wallet.address) return "the sender is not this wallet";
-    if (cosmosText(send[2]?.[0]) !== destination) return "recipient differs";
-    if (cosmosText(coin[1]?.[0]) !== c.denom) return `only ${c.coin} can be sent`;
-    if (!/^\d+$/.test(cosmosText(coin[2]?.[0])) || BigInt(cosmosText(coin[2]?.[0])) !== amount) return "amount differs";
-    if (cosmosText(body[2]?.[0]) !== memo) return "memo differs";
+    // Body: messages (field 1, repeated), memo (2). Anything else (timeout, extensions) is refused.
+    const bodyFields = cosmosFields(d[1][0].bytes);
+    if (bodyFields.some((f) => f.field !== 1 && f.field !== 2) || bodyFields.filter((f) => f.field === 2).length > 1) return "unexpected field in the transaction body";
+    const msgs = bodyFields.filter((f) => f.field === 1).map((f) => {
+      const a = cosmosMessage(f.bytes, [1, 2]);
+      return { type: cosmosText(a[1]?.[0]), value: a[2]?.[0]?.bytes ?? Buffer.alloc(0) };
+    });
+    const bodyMemo = cosmosText(bodyFields.find((f) => f.field === 2));
+    if (!msgs.length) return "the transaction carries no message";
+    const coinOf = (m) => cosmosMessage(m[3]?.[0]?.bytes ?? Buffer.alloc(0), [1, 2]);
+    if (op === "transfer") {
+      if (msgs.length !== 1 || msgs[0].type !== COSMOS_SEND) return "not a bank send";
+      const send = cosmosMessage(msgs[0].value, [1, 2, 3]);
+      const coin = coinOf(send);
+      if (cosmosText(send[1]?.[0]) !== wallet.address) return "the sender is not this wallet";
+      if (cosmosText(send[2]?.[0]) !== destination) return "recipient differs";
+      if (cosmosText(coin[1]?.[0]) !== c.denom) return `only ${c.coin} can be sent`;
+      if (!/^\d+$/.test(cosmosText(coin[2]?.[0])) || BigInt(cosmosText(coin[2]?.[0])) !== amount) return "amount differs";
+      if (bodyMemo !== memo) return "memo differs";
+    } else {
+      const od = approved.operation_data ?? {};
+      if (bodyMemo !== "") return "a staking transaction carries no memo";
+      if (op === "delegate" || op === "undelegate") {
+        if (msgs.length !== 1 || msgs[0].type !== (op === "delegate" ? COSMOS_DELEGATE : COSMOS_UNDELEGATE)) return `not a ${op}`;
+        const m = cosmosMessage(msgs[0].value, [1, 2, 3]);
+        const coin = coinOf(m);
+        if (cosmosText(m[1]?.[0]) !== wallet.address) return "the delegator is not this wallet";
+        if (cosmosText(m[2]?.[0]) !== String(od.validator ?? "") || !String(od.validator ?? "").startsWith(`${c.prefix}valoper1`)) return "validator differs";
+        if (cosmosText(coin[1]?.[0]) !== c.denom) return `only ${c.coin} can be staked`;
+        if (!/^\d+$/.test(cosmosText(coin[2]?.[0])) || BigInt(cosmosText(coin[2]?.[0])) !== amount) return "amount differs";
+      } else {
+        const wanted = Array.isArray(od.validators) ? od.validators.map(String) : [];
+        if (!wanted.length || msgs.length !== wanted.length) return "the validators differ";
+        for (const [i, msg] of msgs.entries()) {
+          if (msg.type !== COSMOS_WITHDRAW_REWARD) return "not a reward withdrawal";
+          const m = cosmosMessage(msg.value, [1, 2]);
+          if (cosmosText(m[1]?.[0]) !== wallet.address) return "the delegator is not this wallet";
+          if (cosmosText(m[2]?.[0]) !== wanted[i]) return "validator differs";
+        }
+      }
+    }
     const auth = cosmosMessage(d[2][0].bytes, [1, 2]);
     if (!auth[1] || !auth[2]) return "unreadable signer or fee";
     const signer = cosmosMessage(auth[1][0].bytes, [1, 2, 3]);
