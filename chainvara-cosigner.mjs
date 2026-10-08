@@ -524,8 +524,14 @@ async function handleMpc(req, { secret, master, policy, approvals }) {
     : { problem: checkSolanaMessage(message, k.address, approved) };
   if (checked.problem) return reject(`The transaction does not match what was approved: ${checked.problem}`);
   if (chain === "solana") {
-    // Two Solana transactions with different blockhashes would both be valid: one signature per approval.
-    if (approved.sol_signed_at) return reject("This approval was already signed once: request a new transfer.");
+    // Two Solana transactions with different blockhashes could both land while both are valid. A blockhash lives about
+    // 150 slots (one to two minutes) and durable nonces are refused above, so a new signature for the same approval is
+    // accepted only 5 minutes after the previous one — when that transaction can no longer land — and 4 times at most.
+    if (approved.sol_signed_at) {
+      if (Date.now() - Date.parse(approved.sol_signed_at) < 5 * 60_000) return reject("This approval was signed less than 5 minutes ago: its transaction may still land. It can be signed again once it has expired.");
+      if ((approved.sol_signatures ?? 1) >= 4) return reject("This approval was already signed four times: request a new transfer.");
+    }
+    approved.sol_signatures = (approved.sol_signatures ?? 0) + 1;
     approved.sol_signed_at = new Date().toISOString();
   } else {
     // XRP Ledger, Stellar, Aptos: an account sequence number is used once on chain. Re-signing with the same one
