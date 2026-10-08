@@ -1930,7 +1930,7 @@ export function checkTronTransaction(rawHex, wallet, approved, policy = DEFAULT_
   if (approved.network !== wallet.network) return "network differs";
   const op = approved.operation ?? "transfer";
   // Stake 2.0: staking TRX for energy or bandwidth, unstaking, withdrawing — the TRX never leaves this wallet.
-  const RESOURCE_OPS = { tron_stake: 54, tron_unstake: 55, tron_withdraw_unstaked: 56 };
+  const RESOURCE_OPS = { tron_stake: 54, tron_unstake: 55, tron_withdraw_unstaked: 56, tron_delegate: 57, tron_undelegate: 58 };
   if (op !== "transfer" && !(op in RESOURCE_OPS)) return "Tron MPC wallets sign transfers and TRX staking only";
   const raw = Buffer.from(rawHex, "hex");
   try {
@@ -1948,6 +1948,16 @@ export function checkTronTransaction(rawHex, wallet, approved, policy = DEFAULT_
     if (pbBytes(value, 1).toString("hex") !== own) return "the transaction is not from this wallet";
     if (op !== "transfer") {
       if (type !== RESOURCE_OPS[op]) return "not the approved staking operation";
+      if (op === "tron_delegate" || op === "tron_undelegate") {
+        // Lending energy or bandwidth: the approved receiver (the transfer's screened destination), amount and resource, never locked.
+        const lent = approved.amount_atomic != null ? BigInt(approved.amount_atomic) : atomic(approved.amount, 6);
+        const resource = approved.operation_data?.resource === "ENERGY" ? 1n : approved.operation_data?.resource === "BANDWIDTH" ? 0n : -1n;
+        if (pbInt(value, 2) !== resource) return "delegated resource differs";
+        if (pbInt(value, 3) !== lent) return "delegated amount differs";
+        if (pbBytes(value, 4).toString("hex") !== tronHex(approved.destination)) return "receiver differs";
+        if (pbInt(value, 5) !== 0n) return "a locked delegation is refused";
+        return { hash: sha256(raw).toString("hex"), nonce: "tron", kind: "transfer" };
+      }
       if (op !== "tron_withdraw_unstaked") {
         const staked = approved.amount_atomic != null ? BigInt(approved.amount_atomic) : atomic(approved.amount, 6);
         if (pbInt(value, 2) !== staked) return "staking amount differs";
