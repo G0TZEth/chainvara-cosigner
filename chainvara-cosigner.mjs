@@ -2163,12 +2163,16 @@ export function checkBitcoinTaproot(txHex, prevouts, wallet, approved) {
   if (spent.some((p) => !p.script.equals(own) || p.value <= 0n)) return "it spends coins that do not belong to this wallet";
   let paid = 0n;
   let out = 0n;
+  // Cancellation by replace-by-fee: everything back to this wallet, spending exactly the coins this approval already
+  // signed — the two versions then conflict, and at most one is ever included.
+  const cancel = tx.outs.length > 0 && tx.outs.every((o) => o.script.equals(own));
+  if (cancel && approved.btc_outpoints !== tx.ins.map((i) => i.outpoint.toString("hex")).sort().join(",")) return "a cancellation must spend exactly the coins this approval already signed";
   for (const o of tx.outs) {
     out += o.value;
     if (o.script.equals(dest)) paid += o.value;
     else if (!o.script.equals(own)) return "it pays an address that was not approved";
   }
-  if (paid !== amount || tx.outs.filter((o) => o.script.equals(dest)).length !== 1) return `it does not send exactly ${approved.amount} to the approved address`;
+  if (!cancel && (paid !== amount || tx.outs.filter((o) => o.script.equals(dest)).length !== 1)) return `it does not send exactly ${approved.amount} to the approved address`;
   const fee = spent.reduce((a, p) => a + p.value, 0n) - out;
   if (fee < 0n) return "outputs exceed inputs";
   if (fee > MAX_FEE_SATS) return `the fee (${fee} sats) is above the co-signer limit`;
@@ -2474,12 +2478,16 @@ export function checkUtxoEcdsa(txHex, prevouts, input, wallet, approved) {
   if (spent.some((p) => !p.script.equals(own) || p.value <= 0n)) return "it spends coins that do not belong to this wallet";
   let paid = 0n;
   let out = 0n;
+  // Cancellation by replace-by-fee: everything back to this wallet, spending exactly the coins this approval already
+  // signed — the two versions then conflict, and at most one is ever included.
+  const cancel = tx.outs.length > 0 && tx.outs.every((o) => o.script.equals(own));
+  if (cancel && approved.btc_outpoints !== tx.ins.map((i) => i.outpoint.toString("hex")).sort().join(",")) return "a cancellation must spend exactly the coins this approval already signed";
   for (const o of tx.outs) {
     out += o.value;
     if (o.script.equals(dest)) paid += o.value;
     else if (!o.script.equals(own)) return "it pays an address that was not approved";
   }
-  if (paid !== amount || tx.outs.filter((o) => o.script.equals(dest)).length !== 1) return `it does not send exactly ${approved.amount} to the approved address`;
+  if (!cancel && (paid !== amount || tx.outs.filter((o) => o.script.equals(dest)).length !== 1)) return `it does not send exactly ${approved.amount} to the approved address`;
   const fee = spent.reduce((a, p) => a + p.value, 0n) - out;
   if (fee < 0n) return "outputs exceed inputs";
   if (fee > c.maxFee) return `the fee (${fee}) is above the co-signer limit`;
