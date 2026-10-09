@@ -44,16 +44,16 @@ shasum -a 256 chainvara-cosigner.mjs
 ## Install with npm
 
 ```
-npm install -g @chainvara/cosigner@1.2.1
+npm install -g @chainvara/cosigner@1.2.2
 chainvara-cosigner setup
 chainvara-cosigner serve
 ```
 
-Or without installing: `npx @chainvara/cosigner@1.2.1 setup`, then `npx @chainvara/cosigner@1.2.1 serve`. The recovery tool
+Or without installing: `npx @chainvara/cosigner@1.2.2 setup`, then `npx @chainvara/cosigner@1.2.2 serve`. The recovery tool
 is included as `chainvara-recovery`.
 
-- **Pin the version** (`@1.2.1`, never `@latest` on a production machine) and update on purpose after reading the release notes.
-- **Check where it comes from**: every version is published only by this repository's workflow, with a provenance
+- **Pin the version** (`@1.2.2`, never `@latest` on a production machine) and update on purpose after reading the release notes.
+- **Check where it comes from**: every version is published only by this repository's workflow (npm trusted publishing: no npm token exists), with a provenance
   attestation linking it to the exact commit. `npm audit signatures` verifies it; the files match `SHA256SUMS` above and
   in your Chainvara console.
 - **No dependencies**: nothing else is downloaded at install.

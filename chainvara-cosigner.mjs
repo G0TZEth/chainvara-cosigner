@@ -3179,7 +3179,7 @@ export function restoreBackup(entries, master) {
   return { split, mpc };
 }
 
-export const VERSION = "1.2.1";
+export const VERSION = "1.2.2";
 const LOGO = [
   "   ___ _         _                       ",
   "  / __| |_  __ _(_)_ ___ ____ _ _ _ __ _ ",
