@@ -61,6 +61,7 @@ const F = {
   token: path.join(DIR, "local.token"),
   mpc: path.join(DIR, "mpc-keys.json"),
   mpcPending: path.join(DIR, "mpc-pending.json"),
+  lock: path.join(DIR, "serve.lock"),
 };
 const DEFAULT_POLICY = {
   paused: false,
@@ -3008,8 +3009,55 @@ function startApprovalServer(port) {
     res.writeHead(404);
     res.end();
   });
-  server.listen(port, "127.0.0.1");
-  return `http://127.0.0.1:${port}/?t=${token}`;
+  return { url: `http://127.0.0.1:${port}/?t=${token}`, ready: listenLocal(server, port) };
+}
+
+/** Listens on 127.0.0.1 only; a port already taken (usually a co-signer already running) stops with a plain message. */
+function listenLocal(server, port) {
+  return new Promise((resolve) => {
+    server.once("error", (e) => {
+      console.error(e?.code === "EADDRINUSE"
+        ? `Port ${port} is already in use on this machine, most likely by a co-signer that is already running: stop it first. To run a second co-signer on purpose, give it its own COSIGNER_DATA_DIR, COSIGNER_PORT and COSIGNER_APPROVAL_PORT.`
+        : `Cannot listen on 127.0.0.1:${port} (${e?.code ?? e?.message ?? e}).`);
+      process.exit(1);
+    });
+    server.listen(port, "127.0.0.1", resolve);
+  });
+}
+
+/**
+ * One running co-signer per data folder: two would answer the same requests and write the same files at once.
+ * The lock holds the process id; a lock left by a process that no longer exists is taken over.
+ */
+function holdServeLock() {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.writeFileSync(F.lock, String(process.pid), { flag: "wx", mode: 0o600 });
+      process.on("exit", () => {
+        try {
+          if (fs.readFileSync(F.lock, "utf8") === String(process.pid)) fs.unlinkSync(F.lock);
+        } catch {}
+      });
+      for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.once(sig, () => process.exit(0));
+      return;
+    } catch (e) {
+      if (e?.code !== "EEXIST") throw e;
+      const pid = Number(fs.readFileSync(F.lock, "utf8"));
+      let alive = false;
+      try {
+        process.kill(pid, 0);
+        alive = Number.isInteger(pid) && pid > 0;
+      } catch (k) {
+        alive = k?.code === "EPERM";
+      }
+      if (alive) {
+        console.error(`A co-signer is already running with this data folder (process ${pid}): stop it first. If no co-signer is running, delete ${F.lock}.`);
+        process.exit(1);
+      }
+      fs.rmSync(F.lock, { force: true });
+    }
+  }
+  throw new Error(`Could not lock the data folder (${F.lock}).`);
 }
 
 /**
@@ -3077,8 +3125,10 @@ async function serve() {
     process.exit(2);
   }
   const secret = unprotect(fs.readFileSync(F.secret)).toString("utf8");
+  holdServeLock();
   const master = masterKey();
-  const approvalUrl = startApprovalServer(Number(process.env.COSIGNER_APPROVAL_PORT ?? PORT + 1));
+  const approval = startApprovalServer(Number(process.env.COSIGNER_APPROVAL_PORT ?? PORT + 1));
+  const approvalUrl = approval.url;
   const onPending = (d) => console.log(`
 >>> Approval needed: ${d.amount} ${d.asset?.symbol ?? ""} on ${d.network} to ${d.destination}
     Open ${approvalUrl}
@@ -3117,7 +3167,9 @@ async function serve() {
       }
     });
   });
-  server.listen(PORT, "127.0.0.1", () => console.log(`Chainvara co-signer listening on http://127.0.0.1:${PORT} · data in ${DIR}`));
+  // Both local ports first: Chainvara is contacted only once this co-signer can actually run.
+  await Promise.all([approval.ready, listenLocal(server, PORT)]);
+  console.log(`Chainvara co-signer listening on http://127.0.0.1:${PORT} · data in ${DIR}`);
   void outbound(secret, handle);
 }
 
@@ -3179,7 +3231,7 @@ export function restoreBackup(entries, master) {
   return { split, mpc };
 }
 
-export const VERSION = "1.2.2";
+export const VERSION = "1.2.3";
 const LOGO = [
   "   ___ _         _                       ",
   "  / __| |_  __ _(_)_ ___ ____ _ _ _ __ _ ",
@@ -3300,8 +3352,11 @@ async function main() {
 
 // Real paths on both sides: npm runs installed commands through a symlink (Linux, macOS), which must still start main().
 if (process.argv[1] && fs.realpathSync(path.resolve(process.argv[1])) === fs.realpathSync(fileURLToPath(import.meta.url))) {
-  main().catch((e) => {
-    console.error(e?.message ?? e);
+  // A plain message, never a stack trace; COSIGNER_DEBUG=1 shows the trace for support.
+  const fail = (e) => {
+    console.error(process.env.COSIGNER_DEBUG === "1" ? e : `Error: ${e?.message ?? e}`);
     process.exit(1);
-  });
+  };
+  process.on("uncaughtException", fail);
+  main().catch(fail);
 }
