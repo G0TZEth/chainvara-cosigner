@@ -1,0 +1,39 @@
+# Publishes @chainvara/cosigner to npm when a GitHub release is published (tag vX.Y.Z = package.json version).
+# Only this workflow publishes: npm "trusted publishing" (OIDC) accepts this repository, this file and the "npm"
+# environment and nothing else, and every version carries a provenance attestation linking it to this commit
+# (check with: npm audit signatures). The files must match SHA256SUMS, which is also published in the Chainvara console.
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Trusted publishing needs npm 11.5.1 or later
+        run: npm install -g npm@^11.5.1
+      - name: The files are the published ones, the version is the tag, nothing is fetched at install
+        run: |
+          sha256sum -c SHA256SUMS
+          test "v$(node -p 'require("./package.json").version')" = "$GITHUB_REF_NAME"
+          test "$(node -p 'Object.keys({...require("./package.json").dependencies, ...require("./package.json").optionalDependencies}).length')" = "0"
+          node --check chainvara-cosigner.mjs
+          node --check chainvara-recovery.mjs
+      - name: Publish with provenance
+        run: npm publish --provenance --access public
+        env:
+          # Used only for the very first version, before trusted publishing can be set on the package; then deleted.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

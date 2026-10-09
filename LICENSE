@@ -1,0 +1,10 @@
+Chainvara co-signer and recovery tool
+Copyright (c) 2026 Chainvara. All rights reserved.
+
+You may download, install and run these files, unmodified, to operate your own Chainvara organization (co-signing
+its transfers, holding and backing up its key shares, and recovering its keys). You may read and audit them.
+
+You may not redistribute modified copies, or present a modified copy as the Chainvara co-signer.
+
+THE FILES ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. You are responsible for backing up the key shares the
+co-signer holds: a lost share means the funds of that wallet are lost.

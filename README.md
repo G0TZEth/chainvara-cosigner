@@ -41,6 +41,25 @@ Get-FileHash chainvara-cosigner.mjs
 shasum -a 256 chainvara-cosigner.mjs
 ```
 
+## Install with npm
+
+```
+npm install -g @chainvara/cosigner@1.2.0
+chainvara-cosigner setup
+chainvara-cosigner serve
+```
+
+Or without installing: `npx @chainvara/cosigner@1.2.0 setup`, then `npx @chainvara/cosigner@1.2.0 serve`. The recovery tool
+is included as `chainvara-recovery`.
+
+- **Pin the version** (`@1.2.0`, never `@latest` on a production machine) and update on purpose after reading the release notes.
+- **Check where it comes from**: every version is published only by this repository's workflow, with a provenance
+  attestation linking it to the exact commit. `npm audit signatures` verifies it; the files match `SHA256SUMS` above and
+  in your Chainvara console.
+- **No dependencies**: nothing else is downloaded at install.
+- Key shares live in your data folder (`%LOCALAPPDATA%\Chainvara\cosigner`, or `~/.local/share/Chainvara/cosigner`),
+  not in the package: updating or reinstalling never touches them. Back them up all the same.
+
 ## Quick start (Node.js 20+)
 
 1. Chainvara → Developers → API co-signer: leave the address empty (outbound connection), activate, copy the secret (shown once).
