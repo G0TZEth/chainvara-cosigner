@@ -40,7 +40,5 @@ jobs:
           { chainvara-recovery 2>&1 || true; } | grep -q "Commands:"
           rm -f chainvara-cosigner-*.tgz
       - name: Publish with provenance
+        # Trusted publishing (OIDC): no npm token exists; npm accepts only this workflow, in the npm environment.
         run: npm publish --provenance --access public
-        env:
-          # Used only for the very first version, before trusted publishing can be set on the package; then deleted.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
