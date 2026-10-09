@@ -32,6 +32,13 @@ jobs:
           test "$(node -p 'Object.keys({...require("./package.json").dependencies, ...require("./package.json").optionalDependencies}).length')" = "0"
           node --check chainvara-cosigner.mjs
           node --check chainvara-recovery.mjs
+      - name: The installed commands start (npm runs them through symlinks on Linux and macOS)
+        run: |
+          npm pack --silent
+          npm install -g ./chainvara-cosigner-*.tgz
+          test "$(chainvara-cosigner --version)" = "$(node -p 'require("./package.json").version')"
+          { chainvara-recovery 2>&1 || true; } | grep -q "Commands:"
+          rm -f chainvara-cosigner-*.tgz
       - name: Publish with provenance
         run: npm publish --provenance --access public
         env:

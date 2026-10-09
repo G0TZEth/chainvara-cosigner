@@ -3179,8 +3179,27 @@ export function restoreBackup(entries, master) {
   return { split, mpc };
 }
 
+export const VERSION = "1.2.1";
+const LOGO = [
+  "   ___ _         _                       ",
+  "  / __| |_  __ _(_)_ ___ ____ _ _ _ __ _ ",
+  " | (__| ' \\/ _` | | ' \\ V / _` | '_/ _` |",
+  "  \\___|_||_\\__,_|_|_||_\\_/\\__,_|_| \\__,_|",
+];
+
+/** The logo, on an interactive terminal only (never in logs or piped output such as status, which is JSON). */
+function banner() {
+  if (!process.stdout.isTTY) return;
+  const color = !process.env.NO_COLOR;
+  const paint = (code, s) => (color ? `\x1b[${code}m${s}\x1b[0m` : s);
+  console.log(paint("38;5;105", LOGO.join("\n")));
+  console.log(paint("2", `  co-signer v${VERSION} · your half of every key, your rules\n`));
+}
+
 async function main() {
   const [cmd = "serve", arg] = process.argv.slice(2);
+  if (cmd === "version" || cmd === "--version" || cmd === "-v") return console.log(VERSION);
+  if (cmd === "serve" || cmd === "setup" || cmd === "help" || cmd === "--help" || cmd === "-h") banner();
   ensureDir();
   if (!fs.existsSync(F.policy)) writeJson(F.policy, DEFAULT_POLICY);
   if (cmd === "serve") return serve();
@@ -3273,11 +3292,14 @@ async function main() {
     console.log(`Restored ${r.split} split-key share(s) and ${r.mpc} MPC key share(s).`);
     return;
   }
-  console.error("Commands: setup | serve | status | pause | resume | backup <file> | restore <file> | verify <file> | approvals | approve <id> | reject <id> | callback-secret");
+  const commands = "Commands: setup | serve | status | pause | resume | backup <file> | restore <file> | verify <file> | approvals | approve <id> | reject <id> | callback-secret | version";
+  if (cmd === "help" || cmd === "--help" || cmd === "-h") return console.log(commands);
+  console.error(commands);
   process.exit(1);
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// Real paths on both sides: npm runs installed commands through a symlink (Linux, macOS), which must still start main().
+if (process.argv[1] && fs.realpathSync(path.resolve(process.argv[1])) === fs.realpathSync(fileURLToPath(import.meta.url))) {
   main().catch((e) => {
     console.error(e?.message ?? e);
     process.exit(1);
